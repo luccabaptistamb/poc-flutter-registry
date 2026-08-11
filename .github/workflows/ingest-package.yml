@@ -573,20 +573,26 @@ jobs:
           dart pub get --enforce-lockfile
 
           # An empty cache means a successful resolution had to download
-          # everything. Assert it, so a silent no-op cannot pass as success.
-          CACHED="$(
-            find "$PUB_CACHE/hosted" -maxdepth 2 -mindepth 2 -type d 2>/dev/null \
-              | wc -l | tr -d ' '
-          )"
+          # everything. Assert that each approved package really came from
+          # production, so a silent no-op cannot pass as success.
+          MISSING=0
+
+          while IFS=$'\t' read -r NAME VERSION || [[ -n "${NAME:-}" ]]; do
+            [[ -n "${NAME:-}" ]] || continue
+            if ! compgen -G "$PUB_CACHE/hosted/*/${NAME}-${VERSION}" >/dev/null; then
+              echo "Not downloaded from production: ${NAME}-${VERSION}" >&2
+              MISSING=$((MISSING + 1))
+            fi
+          done < packages.tsv
+
           EXPECTED="$(wc -l < packages.tsv | tr -d ' ')"
 
-          echo "packages downloaded from production: ${CACHED} (expected ${EXPECTED})"
-
-          if [[ "$CACHED" -ne "$EXPECTED" ]]; then
-            echo "Expected production to serve exactly ${EXPECTED} packages." >&2
-            find "$PUB_CACHE/hosted" -maxdepth 2 -mindepth 2 -type d >&2 || true
+          if [[ "$MISSING" -ne 0 ]]; then
+            echo "${MISSING} of ${EXPECTED} approved packages were not served by production." >&2
             exit 1
           fi
+
+          echo "All ${EXPECTED} approved packages were downloaded from production."
 
           {
             echo

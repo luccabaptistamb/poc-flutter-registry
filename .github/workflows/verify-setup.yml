@@ -188,7 +188,6 @@ jobs:
           fi
 
           PRODUCTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${PRODUCTION_REPO}/"
-          INGESTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${INGESTION_REPO}/"
 
           # Guard: the negative test is meaningless if the package was promoted.
           PRESENT="$(
@@ -204,7 +203,6 @@ jobs:
 
           # Authenticate first, so a failure means "not found" and not "401".
           dart pub token add "$PRODUCTION_URL" --env-var CLOUDSMITH_API_KEY
-          dart pub token add "$INGESTION_URL" --env-var CLOUDSMITH_API_KEY
 
           mkdir -p "$RUNNER_TEMP/negative-probe"
 
@@ -225,39 +223,15 @@ jobs:
           cd "$RUNNER_TEMP/negative-probe"
 
           export PUB_CACHE="$RUNNER_TEMP/pub-cache-negative"
-
-          # On the first `flutter pub get` in a fresh PUB_CACHE the Flutter tool
-          # resolves its own package graph (analyzer, dwds, test, ...) into the
-          # cache. Those are SDK toolchain packages and are never promoted, so
-          # without bootstrapping them through ingestion the resolution below
-          # would fail on the toolchain instead of on the unapproved package,
-          # passing this test for the wrong reason.
-          mkdir -p "$RUNNER_TEMP/tool-bootstrap"
-
-          cat > "$RUNNER_TEMP/tool-bootstrap/pubspec.yaml" <<'EOF'
-          name: flutter_tool_bootstrap
-          publish_to: none
-
-          environment:
-            sdk: ">=3.0.0 <4.0.0"
-
-          dependencies:
-            flutter:
-              sdk: flutter
-          EOF
-
-          echo "::group::Bootstrap the Flutter toolchain through ingestion"
-          (
-            cd "$RUNNER_TEMP/tool-bootstrap"
-            PUB_HOSTED_URL="$INGESTION_URL" flutter pub get
-          )
-          echo "::endgroup::"
-
           export PUB_HOSTED_URL="$PRODUCTION_URL"
 
           echo "Resolving '${PROBE_PACKAGE}' against production only..."
 
-          if flutter pub get 2>&1 | tee /tmp/negative.log; then
+          # `dart pub get`, not `flutter pub get`: the flutter wrapper would
+          # re-resolve flutter_tools' own dependencies against production and
+          # fail on the SDK toolchain, making this test pass for the wrong
+          # reason. See the note in ingest-package.yml.
+          if dart pub get 2>&1 | tee /tmp/negative.log; then
             echo >&2
             echo "NEGATIVE TEST FAILED." >&2
             echo "Production resolved '${PROBE_PACKAGE}', which was never promoted." >&2

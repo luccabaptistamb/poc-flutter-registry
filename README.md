@@ -63,7 +63,7 @@ setup Flutter → OIDC Cloudsmith → probe pubspec.yaml → flutter pub get
 
 ```text
 download evidência → OIDC Cloudsmith → cloudsmith copy (por package)
-→ troca a URL no lockfile → flutter pub get --enforce-lockfile
+→ troca a URL no lockfile → dart pub get --enforce-lockfile
 ```
 
 O segundo job **não recalcula** o grafo. Ele promove exatamente o grafo que foi
@@ -194,10 +194,45 @@ repositories e a ausência de upstream em production.
 
 ## Limitações conhecidas
 
+**A verificação usa `dart pub get`, não `flutter pub get`.** O wrapper `flutter`
+reresolve o `pubspec.lock` do próprio `flutter_tools` sempre que `PUB_HOSTED_URL`
+muda, porque esse lockfile registra as URLs de onde as dependências vieram. Isso
+arrasta o toolchain do SDK (`analyzer`, `dwds`, `dds`, `test`, ~90 packages) para
+a resolução, e esses packages não fazem parte do grafo de nenhuma aplicação e não
+são promovidos. Resultado:
+
+```text
+PUB_HOSTED_URL=production  flutter pub get   ->  falha no flutter_tools
+PUB_HOSTED_URL=production  dart pub get      ->  OK
+```
+
+Verificado com `PUB_CACHE` novo **e** com `PUB_CACHE` quente contendo o toolchain:
+falha nos dois casos, então não é cache. `dart pub get` resolve apenas o projeto,
+com as dependências `sdk:` vindo do `FLUTTER_ROOT`, e é o que a POC usa para
+provar que production entrega o grafo aprovado.
+
+**Consequência para a solução oficial, e não só para a POC:** um developer ou uma
+CI que aponte `PUB_HOSTED_URL` para `flutter-production` e rode `flutter pub get`
+vai falhar do mesmo jeito. Antes do rollout é preciso decidir entre:
+
+- promover o toolchain do SDK para production como um baseline por versão de
+  Flutter (e revalidar a cada upgrade de SDK);
+- expor aos consumidores um repository que contenha production + esse baseline;
+- padronizar `dart pub get` nos consumidores, o que não cobre os comandos do
+  `flutter` que resolvem packages implicitamente.
+
+Nenhuma dessas opções altera o fluxo de ingestão/promoção.
+
 **A promoção não é atômica.** `cloudsmith copy` opera um package por vez. Durante
 a promoção production pode ficar temporariamente incompleto. Um consumer que
 resolver nesse intervalo deve falhar. A solução oficial deve usar `concurrency`
 para serializar promoções.
+
+**O ingestion acumula o toolchain do SDK.** O job de ingestão roda
+`flutter pub get`, o que faz o wrapper resolver o `flutter_tools` através do
+ingestion — cerca de 90 packages além do grafo da aplicação. Isso não afeta a
+promoção, porque o `packages.tsv` vem do `dart pub deps` do probe, mas explica por
+que `flutter-ingestion` tem muito mais packages do que o esperado.
 
 **O probe não representa os constraints de todas as aplicações.** A POC prova que
 o package tem uma closure resolvível para o SDK configurado. Uma aplicação com

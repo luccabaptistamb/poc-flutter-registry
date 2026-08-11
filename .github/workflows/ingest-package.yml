@@ -526,26 +526,19 @@ jobs:
 
           echo "Lockfile now resolves against ${PRODUCTION_URL}."
 
-      - name: Configure pub registries
+      - name: Configure production registry
         shell: bash
         env:
           NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
-          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
           PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
         run: |
           set -euo pipefail
 
           PRODUCTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${PRODUCTION_REPO}/"
-          INGESTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${INGESTION_REPO}/"
 
           dart pub token add "$PRODUCTION_URL" --env-var CLOUDSMITH_API_KEY
 
-          # Ingestion is registered only to bootstrap the Flutter tool itself,
-          # never to resolve the application graph. See the next step.
-          dart pub token add "$INGESTION_URL" --env-var CLOUDSMITH_API_KEY
-
           echo "PRODUCTION_URL=$PRODUCTION_URL" >> "$GITHUB_ENV"
-          echo "INGESTION_URL=$INGESTION_URL" >> "$GITHUB_ENV"
 
       - name: Verify production
         working-directory: ${{ runner.temp }}/package-probe
@@ -553,76 +546,55 @@ jobs:
         run: |
           set -euo pipefail
 
+          # An empty PUB_CACHE, so every package in the approved graph has to be
+          # served by production. Nothing can be masked by a warm cache.
           export PUB_CACHE="$RUNNER_TEMP/pub-cache-production"
-
-          # On the first `flutter pub get` in a fresh PUB_CACHE the Flutter tool
-          # resolves its own package graph (analyzer, dwds, dds, test, ...).
-          # Those packages belong to the SDK toolchain, are not part of the
-          # application graph and are deliberately never promoted, so the
-          # bootstrap is served by ingestion in a throwaway project.
-          mkdir -p "$RUNNER_TEMP/tool-bootstrap"
-
-          cat > "$RUNNER_TEMP/tool-bootstrap/pubspec.yaml" <<'EOF'
-          name: flutter_tool_bootstrap
-          publish_to: none
-
-          environment:
-            sdk: ">=3.0.0 <4.0.0"
-
-          dependencies:
-            flutter:
-              sdk: flutter
-          EOF
-
-          echo "::group::Bootstrap the Flutter toolchain through ingestion"
-          (
-            cd "$RUNNER_TEMP/tool-bootstrap"
-            PUB_HOSTED_URL="$INGESTION_URL" flutter pub get
-          )
-          echo "::endgroup::"
-
-          # Every package in the approved graph must be served by production, so
-          # remove exactly those from the cache. The SDK toolchain stays.
-          while IFS=$'\t' read -r NAME VERSION || [[ -n "${NAME:-}" ]]; do
-            [[ -n "${NAME:-}" ]] || continue
-            rm -rf "$PUB_CACHE"/hosted/*/"${NAME}-${VERSION}"
-            rm -f  "$PUB_CACHE"/hosted-hashes/*/"${NAME}-${VERSION}.sha256"
-          done < packages.tsv
-
-          REMAINING=0
-          while IFS=$'\t' read -r NAME VERSION || [[ -n "${NAME:-}" ]]; do
-            [[ -n "${NAME:-}" ]] || continue
-            if compgen -G "$PUB_CACHE/hosted/*/${NAME}-${VERSION}" >/dev/null; then
-              echo "Still cached: ${NAME}-${VERSION}" >&2
-              REMAINING=$((REMAINING + 1))
-            fi
-          done < packages.tsv
-
-          if [[ "$REMAINING" -ne 0 ]]; then
-            echo "Could not clear the approved packages from PUB_CACHE." >&2
-            exit 1
-          fi
-
-          echo "None of the $(wc -l < packages.tsv | tr -d ' ') approved packages are cached."
-
           export PUB_HOSTED_URL="$PRODUCTION_URL"
 
           echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+          echo "PUB_CACHE=$PUB_CACHE (empty)"
 
+          # `dart pub get`, not `flutter pub get`.
+          #
+          # The flutter wrapper re-resolves flutter_tools' own pubspec whenever
+          # PUB_HOSTED_URL changes, because flutter_tools' lockfile records the
+          # URLs its dependencies came from. That pulls the SDK toolchain
+          # (analyzer, dwds, dds, test, ...) into the resolution, and those
+          # packages are deliberately never promoted, so it fails regardless of
+          # the state of PUB_CACHE.
+          #
+          # dart pub resolves only this project. SDK dependencies still come
+          # from FLUTTER_ROOT, so the Flutter-specific graph is preserved, and
+          # every hosted package must come from production.
+          #
           # --enforce-lockfile fails if the lockfile is not a valid resolution
           # of pubspec.yaml, if a required version is unavailable, or if any
           # hosted package content does not match the approved content hash.
-          flutter pub get --enforce-lockfile
+          dart pub get --enforce-lockfile
+
+          # An empty cache means a successful resolution had to download
+          # everything. Assert it, so a silent no-op cannot pass as success.
+          CACHED="$(
+            find "$PUB_CACHE/hosted" -maxdepth 2 -mindepth 2 -type d 2>/dev/null \
+              | wc -l | tr -d ' '
+          )"
+          EXPECTED="$(wc -l < packages.tsv | tr -d ' ')"
+
+          echo "packages downloaded from production: ${CACHED} (expected ${EXPECTED})"
+
+          if [[ "$CACHED" -ne "$EXPECTED" ]]; then
+            echo "Expected production to serve exactly ${EXPECTED} packages." >&2
+            find "$PUB_CACHE/hosted" -maxdepth 2 -mindepth 2 -type d >&2 || true
+            exit 1
+          fi
 
           {
             echo
             echo '## Production verification'
             echo
-            echo 'Every package in the approved graph was removed from PUB_CACHE'
-            echo 'and then resolved against production only.'
-            echo
+            printf 'Resolved the approved lockfile against production only, with an empty PUB_CACHE. All %s packages were served by production.\n\n' "$EXPECTED"
             echo '```text'
-            echo "flutter pub get --enforce-lockfile  ->  OK"
+            echo "dart pub get --enforce-lockfile  ->  OK"
             echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

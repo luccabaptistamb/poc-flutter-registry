@@ -122,7 +122,8 @@ jobs:
           URL="https://dart.cloudsmith.io/${NAMESPACE}/${INGESTION_REPO}/api/packages/${PROBE_PACKAGE}"
 
           CODE="$(
-            curl -sS -o /tmp/ingestion.json -w '%{http_code}' \
+            curl -sS --retry 3 --retry-delay 2 --retry-connrefused \
+              -o /tmp/ingestion.json -w '%{http_code}' \
               -H "Authorization: Bearer ${CLOUDSMITH_API_KEY}" \
               "$URL"
           )"
@@ -151,7 +152,8 @@ jobs:
           URL="https://dart.cloudsmith.io/${NAMESPACE}/${PRODUCTION_REPO}/api/packages/${PROBE_PACKAGE}"
 
           CODE="$(
-            curl -sS -o /tmp/production.json -w '%{http_code}' \
+            curl -sS --retry 3 --retry-delay 2 --retry-connrefused \
+              -o /tmp/production.json -w '%{http_code}' \
               -H "Authorization: Bearer ${CLOUDSMITH_API_KEY}" \
               "$URL"
           )"

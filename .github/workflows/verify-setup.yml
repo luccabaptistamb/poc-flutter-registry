@@ -226,21 +226,48 @@ jobs:
 
           export PUB_CACHE="$RUNNER_TEMP/pub-cache-negative"
 
-          # Bootstrap the Flutter tool through ingestion. The tool resolves its
-          # own package graph (flutter_tools) into PUB_CACHE, and it needs
-          # packages such as `test` that are never promoted. Without this the
-          # resolution below would fail on flutter_tools instead of on the
-          # unapproved package, passing the test for the wrong reason.
-          PUB_HOSTED_URL="$INGESTION_URL" flutter --version >/dev/null
+          # On the first `flutter pub get` in a fresh PUB_CACHE the Flutter tool
+          # resolves its own package graph (analyzer, dwds, test, ...) into the
+          # cache. Those are SDK toolchain packages and are never promoted, so
+          # without bootstrapping them through ingestion the resolution below
+          # would fail on the toolchain instead of on the unapproved package,
+          # passing this test for the wrong reason.
+          mkdir -p "$RUNNER_TEMP/tool-bootstrap"
+
+          cat > "$RUNNER_TEMP/tool-bootstrap/pubspec.yaml" <<'EOF'
+          name: flutter_tool_bootstrap
+          publish_to: none
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+          EOF
+
+          echo "::group::Bootstrap the Flutter toolchain through ingestion"
+          (
+            cd "$RUNNER_TEMP/tool-bootstrap"
+            PUB_HOSTED_URL="$INGESTION_URL" flutter pub get
+          )
+          echo "::endgroup::"
 
           export PUB_HOSTED_URL="$PRODUCTION_URL"
 
           echo "Resolving '${PROBE_PACKAGE}' against production only..."
 
-          if flutter pub get; then
+          if flutter pub get 2>&1 | tee /tmp/negative.log; then
             echo >&2
             echo "NEGATIVE TEST FAILED." >&2
             echo "Production resolved '${PROBE_PACKAGE}', which was never promoted." >&2
+            exit 1
+          fi
+
+          if ! grep -q "$PROBE_PACKAGE" /tmp/negative.log; then
+            echo >&2
+            echo "Resolution failed, but not because of '${PROBE_PACKAGE}'." >&2
+            echo "The negative test is inconclusive; inspect the output above." >&2
             exit 1
           fi
 

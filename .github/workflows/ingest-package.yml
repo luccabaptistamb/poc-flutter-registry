@@ -555,18 +555,59 @@ jobs:
 
           export PUB_CACHE="$RUNNER_TEMP/pub-cache-production"
 
-          # The Flutter tool resolves its own package graph (flutter_tools)
-          # into PUB_CACHE. A brand new PUB_CACHE makes that bootstrap run
-          # again, and it needs packages such as `test` that are deliberately
-          # never promoted to production. Bootstrap the tool through ingestion
-          # first, so that the resolution below covers only the application
-          # graph and any failure is attributable to production.
-          PUB_HOSTED_URL="$INGESTION_URL" flutter --version >/dev/null
+          # On the first `flutter pub get` in a fresh PUB_CACHE the Flutter tool
+          # resolves its own package graph (analyzer, dwds, dds, test, ...).
+          # Those packages belong to the SDK toolchain, are not part of the
+          # application graph and are deliberately never promoted, so the
+          # bootstrap is served by ingestion in a throwaway project.
+          mkdir -p "$RUNNER_TEMP/tool-bootstrap"
+
+          cat > "$RUNNER_TEMP/tool-bootstrap/pubspec.yaml" <<'EOF'
+          name: flutter_tool_bootstrap
+          publish_to: none
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+          EOF
+
+          echo "::group::Bootstrap the Flutter toolchain through ingestion"
+          (
+            cd "$RUNNER_TEMP/tool-bootstrap"
+            PUB_HOSTED_URL="$INGESTION_URL" flutter pub get
+          )
+          echo "::endgroup::"
+
+          # Every package in the approved graph must be served by production, so
+          # remove exactly those from the cache. The SDK toolchain stays.
+          while IFS=$'\t' read -r NAME VERSION || [[ -n "${NAME:-}" ]]; do
+            [[ -n "${NAME:-}" ]] || continue
+            rm -rf "$PUB_CACHE"/hosted/*/"${NAME}-${VERSION}"
+            rm -f  "$PUB_CACHE"/hosted-hashes/*/"${NAME}-${VERSION}.sha256"
+          done < packages.tsv
+
+          REMAINING=0
+          while IFS=$'\t' read -r NAME VERSION || [[ -n "${NAME:-}" ]]; do
+            [[ -n "${NAME:-}" ]] || continue
+            if compgen -G "$PUB_CACHE/hosted/*/${NAME}-${VERSION}" >/dev/null; then
+              echo "Still cached: ${NAME}-${VERSION}" >&2
+              REMAINING=$((REMAINING + 1))
+            fi
+          done < packages.tsv
+
+          if [[ "$REMAINING" -ne 0 ]]; then
+            echo "Could not clear the approved packages from PUB_CACHE." >&2
+            exit 1
+          fi
+
+          echo "None of the $(wc -l < packages.tsv | tr -d ' ') approved packages are cached."
 
           export PUB_HOSTED_URL="$PRODUCTION_URL"
 
           echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
-          echo "PUB_CACHE=$PUB_CACHE (no application packages)"
 
           # --enforce-lockfile fails if the lockfile is not a valid resolution
           # of pubspec.yaml, if a required version is unavailable, or if any
@@ -577,7 +618,8 @@ jobs:
             echo
             echo '## Production verification'
             echo
-            echo 'Resolved the approved lockfile against production only.'
+            echo 'Every package in the approved graph was removed from PUB_CACHE'
+            echo 'and then resolved against production only.'
             echo
             echo '```text'
             echo "flutter pub get --enforce-lockfile  ->  OK"

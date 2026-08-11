@@ -46,7 +46,10 @@ Propriedade central:
 | Workflow | Para que serve |
 |---|---|
 | `.github/workflows/ingest-package.yml` | fluxo principal: resolve, pede aprovação, promove, verifica |
+| `.github/workflows/promote-sdk-baseline.yml` | promove o baseline do Flutter SDK, sem o qual `flutter pub get` não funciona contra production |
 | `.github/workflows/verify-setup.yml` | preflight do setup Cloudsmith + teste negativo (Teste D) |
+
+A lógica de promoção é compartilhada em `scripts/promote-packages.sh`.
 
 ### `ingest-package.yml`
 
@@ -63,11 +66,46 @@ setup Flutter → OIDC Cloudsmith → probe pubspec.yaml → flutter pub get
 
 ```text
 download evidência → OIDC Cloudsmith → cloudsmith copy (por package)
-→ troca a URL no lockfile → dart pub get --enforce-lockfile
+→ troca a URL no lockfile
+→ dart pub get --enforce-lockfile      (integridade do grafo aprovado)
+→ flutter pub get --enforce-lockfile   (caminho real do consumidor)
 ```
 
 O segundo job **não recalcula** o grafo. Ele promove exatamente o grafo que foi
 apresentado ao reviewer.
+
+### `promote-sdk-baseline.yml`
+
+`flutter-production` precisa servir dois conjuntos para ser o único pub host:
+
+```text
+grafo aprovado das aplicações   ← ingest-package.yml, por solicitação
+baseline do Flutter SDK         ← promote-sdk-baseline.yml, por versão de SDK
+```
+
+O baseline existe porque o wrapper `flutter` reresolve as dependências do próprio
+`flutter_tools` sempre que `PUB_HOSTED_URL` muda, e porque packages fornecidos
+pelo SDK (`flutter_test`, `flutter_localizations`, `integration_test`) têm
+dependências hosted que não pertencem ao grafo de nenhuma aplicação específica.
+
+O conjunto é **derivado, nunca hardcoded**, da união de duas resoluções feitas
+através do ingestion com os pins do próprio SDK:
+
+```text
+flutter_tools/.dart_tool/package_config.json   (analyzer, dwds, dds, test, ...)
+        ∪
+closure hosted de um probe com todos os packages do SDK
+```
+
+**Rode esta workflow depois de cada upgrade de `FLUTTER_VERSION`.** Ela também é
+gated pelo mesmo Environment, e o Job Summary mostra o conjunto completo para
+revisão.
+
+> Todo package em production está implicitamente aprovado para uso. O baseline é
+> revisado como um conjunto, não package por package. Por isso ele é derivado do
+> mínimo que o SDK exige, e não do `pubspec.lock` da raiz do SDK, que tem 141
+> packages e incluiria dependências dos apps de exemplo do Flutter
+> (`animations`, `adaptive_breakpoints`) sem nenhuma relação com o toolchain.
 
 ---
 
@@ -194,34 +232,27 @@ repositories e a ausência de upstream em production.
 
 ## Limitações conhecidas
 
-**A verificação usa `dart pub get`, não `flutter pub get`.** O wrapper `flutter`
-reresolve o `pubspec.lock` do próprio `flutter_tools` sempre que `PUB_HOSTED_URL`
-muda, porque esse lockfile registra as URLs de onde as dependências vieram. Isso
-arrasta o toolchain do SDK (`analyzer`, `dwds`, `dds`, `test`, ~90 packages) para
-a resolução, e esses packages não fazem parte do grafo de nenhuma aplicação e não
-são promovidos. Resultado:
+**O baseline do SDK é por versão de Flutter.** Um upgrade de `FLUTTER_VERSION`
+muda os pins do toolchain e exige rodar `promote-sdk-baseline.yml` novamente,
+antes que qualquer consumidor use o SDK novo. Sem isso, `flutter pub get` contra
+production falha no toolchain. As versões antigas continuam em production, então
+o rollback funciona, mas production acumula um baseline por versão de SDK ao longo
+do tempo.
 
-```text
-PUB_HOSTED_URL=production  flutter pub get   ->  falha no flutter_tools
-PUB_HOSTED_URL=production  dart pub get      ->  OK
-```
+**O baseline é aprovado como conjunto, não package por package.** São ~90
+packages do toolchain do SDK. Como todo package em production está
+implicitamente disponível, um developer poderia depender diretamente de
+`analyzer` ou `args` sem passar pelo fluxo de aprovação. Isso é uma consequência
+de um repository único e plano, e é o motivo de o baseline ser derivado do mínimo
+necessário. Se essa superfície for inaceitável, a alternativa é um terceiro
+repository só para o toolchain, com os consumidores usando um endpoint que
+combine os dois — o que sai do escopo do desenho atual.
 
-Verificado com `PUB_CACHE` novo **e** com `PUB_CACHE` quente contendo o toolchain:
-falha nos dois casos, então não é cache. `dart pub get` resolve apenas o projeto,
-com as dependências `sdk:` vindo do `FLUTTER_ROOT`, e é o que a POC usa para
-provar que production entrega o grafo aprovado.
-
-**Consequência para a solução oficial, e não só para a POC:** um developer ou uma
-CI que aponte `PUB_HOSTED_URL` para `flutter-production` e rode `flutter pub get`
-vai falhar do mesmo jeito. Antes do rollout é preciso decidir entre:
-
-- promover o toolchain do SDK para production como um baseline por versão de
-  Flutter (e revalidar a cada upgrade de SDK);
-- expor aos consumidores um repository que contenha production + esse baseline;
-- padronizar `dart pub get` nos consumidores, o que não cobre os comandos do
-  `flutter` que resolvem packages implicitamente.
-
-Nenhuma dessas opções altera o fluxo de ingestão/promoção.
+**Duas verificações, propósitos diferentes.** `dart pub get --enforce-lockfile`
+prova a integridade do grafo aprovado, isolado do toolchain.
+`flutter pub get --enforce-lockfile` prova o caminho real do consumidor e depende
+do baseline. As duas rodam no job de promoção; a segunda falha com uma mensagem
+apontando para `promote-sdk-baseline.yml` quando o problema está no toolchain.
 
 **A promoção não é atômica.** `cloudsmith copy` opera um package por vez. Durante
 a promoção production pode ficar temporariamente incompleto. Um consumer que
@@ -231,8 +262,9 @@ para serializar promoções.
 **O ingestion acumula o toolchain do SDK.** O job de ingestão roda
 `flutter pub get`, o que faz o wrapper resolver o `flutter_tools` através do
 ingestion — cerca de 90 packages além do grafo da aplicação. Isso não afeta a
-promoção, porque o `packages.tsv` vem do `dart pub deps` do probe, mas explica por
-que `flutter-ingestion` tem muito mais packages do que o esperado.
+promoção do grafo aprovado, porque o `packages.tsv` vem do `dart pub deps` do
+probe, mas explica por que `flutter-ingestion` tem muito mais packages do que o
+esperado.
 
 **O probe não representa os constraints de todas as aplicações.** A POC prova que
 o package tem uma closure resolvível para o SDK configurado. Uma aplicação com

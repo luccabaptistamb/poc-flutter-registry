@@ -290,6 +290,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download approved evidence
         uses: actions/download-artifact@v4
         with:
@@ -332,167 +335,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Returns the package Unique ID on stdout once the artifact exists in
-          # <repo> and Cloudsmith reports synchronisation as complete.
-          #
-          # Exact-match anchors are mandatory: `name:foo` is a text search and
-          # could select the wrong artifact.
-          wait_for_package_sync() {
-            local repo="$1"
-            local name="$2"
-            local version="$3"
-
-            local query="format:dart AND name:^${name}$ AND version:^${version}$"
-            local result=""
-            local count=0
-            local package_id=""
-            local status=""
-
-            for attempt in $(seq 1 18); do
-              result="$(
-                cloudsmith ls pkg \
-                  "${CLOUDSMITH_NAMESPACE}/${repo}" \
-                  -q "$query" \
-                  -F json
-              )"
-
-              count="$(jq '.data | length' <<< "$result")"
-
-              if [[ "$count" -gt 1 ]]; then
-                echo "Duplicate exact package match: ${name}@${version} in ${repo}" >&2
-                return 1
-              fi
-
-              if [[ "$count" -eq 1 ]]; then
-                package_id="$(
-                  jq -r '.data[0].slug_perm // .data[0].slug' <<< "$result"
-                )"
-
-                if jq -e '
-                  .data[0]
-                  | (.is_sync_completed == true)
-                    or ((.status_str // "") == "Completed")
-                ' >/dev/null <<< "$result"; then
-                  printf '%s\n' "$package_id"
-                  return 0
-                fi
-
-                if jq -e '
-                  .data[0]
-                  | (.is_sync_failed == true)
-                    or ((.status_str // "") == "Failed")
-                ' >/dev/null <<< "$result"; then
-                  echo "Package synchronisation failed: ${name}@${version} in ${repo}" >&2
-                  return 1
-                fi
-
-                # Fallback for CLI/API builds that do not expose the sync
-                # booleans in the package listing.
-                status="$(
-                  cloudsmith status \
-                    "${CLOUDSMITH_NAMESPACE}/${repo}/${package_id}" \
-                    2>/dev/null || true
-                )"
-
-                if grep -q 'Completed' <<< "$status"; then
-                  printf '%s\n' "$package_id"
-                  return 0
-                fi
-
-                if grep -q 'Failed' <<< "$status"; then
-                  echo "Package synchronisation failed: ${name}@${version} in ${repo}" >&2
-                  return 1
-                fi
-              fi
-
-              sleep 10
-            done
-
-            echo "Timed out waiting for ${name}@${version} in ${repo}." >&2
-            echo "Last listing payload:" >&2
-            jq -c '.data' <<< "$result" >&2 || true
-            return 1
-          }
-
-          PROMOTED=0
-          SKIPPED=0
-
-          {
-            echo "# Promotion result"
-            echo
-            echo '| package | version | action |'
-            echo '| --- | --- | --- |'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          while IFS=$'\t' read -r NAME VERSION || [[ -n "${NAME:-}" ]]; do
-            [[ -n "${NAME:-}" ]] || continue
-
-            echo "::group::${NAME}@${VERSION}"
-
-            PROD_QUERY="format:dart AND name:^${NAME}$ AND version:^${VERSION}$"
-
-            PROD_RESULT="$(
-              cloudsmith ls pkg \
-                "${CLOUDSMITH_NAMESPACE}/${PRODUCTION_REPO}" \
-                -q "$PROD_QUERY" \
-                -F json
-            )"
-
-            PROD_COUNT="$(jq '.data | length' <<< "$PROD_RESULT")"
-
-            if [[ "$PROD_COUNT" -gt 1 ]]; then
-              echo "Duplicate package in production: ${NAME}@${VERSION}" >&2
-              exit 1
-            fi
-
-            if [[ "$PROD_COUNT" -eq 1 ]]; then
-              wait_for_package_sync \
-                "$PRODUCTION_REPO" \
-                "$NAME" \
-                "$VERSION" \
-                >/dev/null
-
-              echo "Already available in production; skipping copy."
-              printf '| `%s` | `%s` | skipped (already present) |\n' \
-                "$NAME" "$VERSION" >> "$GITHUB_STEP_SUMMARY"
-              SKIPPED=$((SKIPPED + 1))
-              echo "::endgroup::"
-              continue
-            fi
-
-            SOURCE_ID="$(
-              wait_for_package_sync \
-                "$INGESTION_REPO" \
-                "$NAME" \
-                "$VERSION"
-            )"
-
-            echo "Copying ${NAME}@${VERSION} (${SOURCE_ID}) to ${PRODUCTION_REPO}"
-
-            cloudsmith copy \
-              "${CLOUDSMITH_NAMESPACE}/${INGESTION_REPO}/${SOURCE_ID}" \
-              "${PRODUCTION_REPO}"
-
-            wait_for_package_sync \
-              "$PRODUCTION_REPO" \
-              "$NAME" \
-              "$VERSION" \
-              >/dev/null
-
-            printf '| `%s` | `%s` | copied |\n' \
-              "$NAME" "$VERSION" >> "$GITHUB_STEP_SUMMARY"
-            PROMOTED=$((PROMOTED + 1))
-
-            echo "::endgroup::"
-          done < "$RUNNER_TEMP/package-probe/packages.tsv"
-
-          {
-            echo
-            printf '**Copied:** %s  \n' "$PROMOTED"
-            printf '**Skipped:** %s\n' "$SKIPPED"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "Promotion finished. copied=${PROMOTED} skipped=${SKIPPED}"
+          bash scripts/promote-packages.sh \
+            "$RUNNER_TEMP/package-probe/packages.tsv" \
+            "approved graph"
 
       - name: Point lockfile to production
         shell: bash
@@ -601,6 +446,52 @@ jobs:
             printf 'Resolved the approved lockfile against production only, with an empty PUB_CACHE. All %s packages were served by production.\n\n' "$EXPECTED"
             echo '```text'
             echo "dart pub get --enforce-lockfile  ->  OK"
+            echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the consumer path with flutter pub get
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # What a developer or a build actually runs. Unlike `dart pub get`,
+          # the flutter wrapper re-resolves flutter_tools' own dependencies
+          # whenever PUB_HOSTED_URL changes, so this only works when the SDK
+          # baseline has been promoted to production.
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-consumer"
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+
+          # Force the toolchain bootstrap so the check is not satisfied by a
+          # resolution left over from an earlier step.
+          rm -rf "$FLUTTER_ROOT/packages/flutter_tools/.dart_tool"
+          rm -f "$FLUTTER_ROOT/bin/cache/flutter_tools.stamp"
+
+          if flutter pub get --enforce-lockfile 2>&1 | tee /tmp/consumer.log; then
+            echo "flutter pub get --enforce-lockfile succeeded against production."
+          else
+            echo >&2
+            echo "flutter pub get failed against production." >&2
+
+            if grep -qE 'flutter_tools|could not find package (test|analyzer|dwds)' /tmp/consumer.log; then
+              echo >&2
+              echo "The failure is in the Flutter SDK toolchain, not in the approved graph." >&2
+              echo "Run the 'Promote Flutter SDK baseline' workflow for Flutter ${FLUTTER_VERSION_LABEL:-$(flutter --version | head -1)}." >&2
+            fi
+
+            exit 1
+          fi
+
+          {
+            echo
+            echo '## Consumer verification'
+            echo
+            echo 'The command a developer or build actually runs, against production'
+            echo 'only, with an empty PUB_CACHE and the toolchain bootstrap forced:'
+            echo
+            echo '```text'
+            echo "flutter pub get --enforce-lockfile  ->  OK"
             echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

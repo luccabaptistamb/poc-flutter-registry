@@ -287,11 +287,11 @@ Nunca criar o provider sem claims — isso permitiria que qualquer repository do
 Confirmado no provider Terraform oficial (`claims` é `schema.TypeMap`, enviado à API como `map[string]interface{}`):
 https://github.com/cloudsmith-io/terraform-provider-cloudsmith/blob/master/cloudsmith/resource_oidc.go
 
-Valor para esta POC:
+Valor para esta POC (confirmado com token real — ver 9.5):
 
 ```json
 {
-  "repository": "<org>/flutter-package-governance",
+  "repository": "luccabaptistamb/poc-flutter-registry",
   "ref": "refs/heads/main"
 }
 ```
@@ -300,7 +300,7 @@ Equivalente em Terraform (para a fase de IaC, seção 38.6 da POC):
 
 ```hcl
 claims = {
-  repository = "<org>/flutter-package-governance"
+  repository = "luccabaptistamb/poc-flutter-registry"
   ref        = "refs/heads/main"
 }
 ```
@@ -316,29 +316,35 @@ Semântica:
 
 Como não há `OR`, se no futuro for preciso aceitar mais de uma branch/environment, as opções são wildcard ou **um provider OIDC por contexto** (que é justamente o caminho sugerido na seção 38.2 da POC para separar a identidade de promotion).
 
-Opcionalmente, para robustez contra rename de org/repo, pode-se usar IDs imutáveis:
+Opcionalmente, para robustez contra rename de owner/repo, é possível usar IDs imutáveis (valores reais deste repo):
 
 ```json
 {
-  "repository_id": "<id>",
-  "repository_owner_id": "<id>",
+  "repository_id": "1331259250",
+  "repository_owner_id": "254526108",
   "ref": "refs/heads/main"
 }
 ```
 
-Cuidado com `aud`: se você declarar `aud` nos claims, o valor precisa ser exatamente o audience que a `cloudsmith-cli-action` solicita ao GitHub. Não declare `aud` sem antes observar o token real (seção 9.4).
+**Não declare `environment`.** O job `ingest` roda sem environment (claim `null`) e o job `promote-and-verify` roda com `environment: cloudsmith-production`. Como os claims declarados são exigidos em AND, declarar `environment` no provider único da POC faria o job `ingest` falhar. Claims que existem no token mas não são declarados no provider são simplesmente ignorados — então `repository` + `ref` autentica os dois jobs.
 
-Evite depender do claim `sub`: o formato default de `sub` do GitHub mudou em julho de 2026 para novos repositories (passou a incluir IDs imutáveis). Se for usar `sub`, observe primeiro o token real.
+**Não declare `aud`.** O audience efetivo solicitado pela `cloudsmith-cli-action@v3` não foi verificado nesta POC (o valor observado em 9.5 veio de um probe com audience hardcoded). Declarar `aud` sem essa confirmação é uma causa provável de falha em `verify-auth`.
+
+Evite depender do claim `sub`: o formato default de `sub` do GitHub mudou em julho de 2026 para novos repositories, passando a incluir IDs imutáveis. Isso foi confirmado neste repository (ver 9.5).
 
 > Na UI pode ser um editor key/value ou um textarea JSON — o conteúdo é idêntico nos dois casos.
 
-### 9.3. Associar o Service Account
+### 9.3. Associar o Service Account e habilitar
 
 ```text
+Name:            github-poc-flutter-registry
+Enabled:         Yes
 Service Account: github-flutter-package-poc
 ```
 
-Sem esse mapeamento o exchange OIDC retorna erro de autorização mesmo com o issuer correto.
+O provider precisa estar **enabled** (no schema da API/Terraform é campo obrigatório) — um provider criado e desabilitado falha silenciosamente no exchange.
+
+Sem o mapeamento para o Service Account o exchange OIDC retorna erro de autorização mesmo com o issuer e os claims corretos.
 
 ### 9.4. Como descobrir o `iss` e os claims reais (recomendado)
 
@@ -379,6 +385,63 @@ Notas de segurança:
 - apague/desabilite essa workflow depois de coletar os valores.
 
 Use o `iss` retornado como Provider URL e os valores retornados de `repository`/`ref` como required claims.
+
+---
+
+### 9.5. Valores observados neste repository
+
+Executado em `luccabaptistamb/poc-flutter-registry`:
+
+```json
+{
+  "iss": "https://token.actions.githubusercontent.com",
+  "aud": "api.cloudsmith.io",
+  "sub": "repo:luccabaptistamb@254526108/poc-flutter-registry@1331259250:ref:refs/heads/main",
+  "repository": "luccabaptistamb/poc-flutter-registry",
+  "repository_owner": "luccabaptistamb",
+  "repository_id": "1331259250",
+  "ref": "refs/heads/main",
+  "environment": null
+}
+```
+
+Leitura destes valores:
+
+| Claim | Observação |
+|---|---|
+| `iss` | GitHub.com padrão, **sem trailing slash** → usar como Provider URL |
+| `aud` | ⚠️ veio do `audience=api.cloudsmith.io` hardcoded no probe; **não** é evidência do audience usado pela `cloudsmith-cli-action@v3` |
+| `sub` | já no **formato novo** (jul/2026) com IDs imutáveis embutidos → confirma a decisão de não usar `sub` |
+| `repository_owner` | é uma **conta pessoal**, não uma organização (ver alerta abaixo) |
+| `environment` | `null` porque o probe não declara `environment:`; no job `promote-and-verify` será `cloudsmith-production` |
+
+Configuração resultante do provider:
+
+```text
+Provider URL: https://token.actions.githubusercontent.com
+
+claims:
+{
+  "repository": "luccabaptistamb/poc-flutter-registry",
+  "ref": "refs/heads/main"
+}
+```
+
+- [ ] Remover ou desabilitar a workflow de inspeção de claims após esta etapa.
+
+> ⚠️ **Risco fora do Cloudsmith:** o repository pertence a uma conta pessoal. Em repositories **privados**, as protection rules de GitHub Environments (incluindo **Required reviewers**) exigem GitHub Pro/Team/Enterprise — e sem elas o critério de sucesso nº 6 da POC (promoção bloqueada aguardando aprovação manual) não é demonstrável.
+>
+> **Solução para conta Free: tornar o repository público.** Ambientes, secrets de ambiente e deployment protection rules estão disponíveis em repositories públicos em todos os planos atuais do GitHub (a exclusão é apenas para planos legados Bronze/Silver/Gold).
+> Fonte: https://docs.github.com/en/actions/deployment/targeting-different-environments/using-environments-for-deployment
+>
+> Ao tornar o repo público, considerar:
+>
+> - **Não habilitar "Prevent self-review"** — sendo conta pessoal, você é o único reviewer possível e o gate ficaria impossível de satisfazer. Auto-aprovação ainda valida o Teste C: o job permanece em `Waiting` e nada é promovido antes da aprovação explícita.
+> - Logs, Job Summary e artifacts passam a ser públicos, incluindo o `reason` e o `packages.tsv`. Conteúdo é uma lista de packages públicos do pub.dev — impacto baixo para a POC.
+> - Nenhum secret é exposto: a autenticação é OIDC e o provider está restrito a `repository` + `ref`, então forks e outras branches não conseguem obter token.
+> - `workflow_dispatch` exige permissão de write no repository, então usuários externos não disparam a workflow.
+>
+> A alternativa é usar um plano ou organização com Environments protegidos em repo privado.
 
 ---
 
@@ -474,11 +537,13 @@ FLUTTER_VERSION             = <versão do ecossistema alvo>
 
 ### OIDC
 
-- [ ] claim `iss` real observado no token do GitHub
-- [ ] OIDC Provider criado com Provider URL == `iss`
-- [ ] claims configurados como objeto JSON: `{"repository": "...", "ref": "refs/heads/main"}`
-- [ ] nenhum claim extra declarado sem ter sido observado no token real
+- [ ] claim `iss` real observado no token do GitHub — feito (9.5)
+- [ ] OIDC Provider criado com Provider URL `https://token.actions.githubusercontent.com`
+- [ ] claims configurados: `{"repository": "luccabaptistamb/poc-flutter-registry", "ref": "refs/heads/main"}`
+- [ ] `aud` **não** declarado
+- [ ] `environment` **não** declarado
 - [ ] provider associado ao Service Account
+- [ ] provider **enabled**
 - [ ] workflow de inspeção de claims removida/desabilitada
 
 ### Validação

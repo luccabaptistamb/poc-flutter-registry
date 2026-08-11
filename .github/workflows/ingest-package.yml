@@ -1,0 +1,564 @@
+name: Ingest Flutter/Dart package
+
+run-name: >-
+  Ingest ${{ inputs.package }}@${{ inputs.version }}
+  requested by ${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package name (exact, lowercase Dart package name)
+        required: true
+        type: string
+
+      version:
+        description: Exact package version (no ranges, no carets)
+        required: true
+        type: string
+
+      reason:
+        description: Reason for adoption
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  # The cloudsmith-cli-action default audience is
+  # https://github.com/<repository_owner>. Pinning it makes the emitted JWT
+  # deterministic and matches the token that was inspected when the Cloudsmith
+  # OIDC provider was configured. If Cloudsmith declares an `aud` claim, it
+  # must equal this value.
+  CLOUDSMITH_OIDC_AUDIENCE: api.cloudsmith.io
+
+jobs:
+
+  ingest:
+    name: Resolve through ingestion
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ vars.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Configure Cloudsmith CLI with OIDC
+        uses: cloudsmith-io/cloudsmith-cli-action@v3
+        with:
+          oidc-namespace: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          oidc-service-slug: ${{ vars.CLOUDSMITH_INGEST_SERVICE }}
+          oidc-audience: ${{ env.CLOUDSMITH_OIDC_AUDIENCE }}
+          verify-auth: 'true'
+          export-auth-token: 'true'
+
+      - name: Assert Cloudsmith token is available to dart pub
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CLOUDSMITH_API_KEY:-}" ]]; then
+            echo "CLOUDSMITH_API_KEY was not exported by the Cloudsmith action." >&2
+            echo "export-auth-token must be 'true' and the CLI must be >= 1.21.0." >&2
+            exit 1
+          fi
+
+          echo "Cloudsmith token is present in the job environment."
+
+      - name: Create dependency probe
+        shell: bash
+        env:
+          PACKAGE: ${{ inputs.package }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$PACKAGE" =~ ^[a-z][a-z0-9_]*$ ]]; then
+            echo "Invalid Dart package name: $PACKAGE" >&2
+            exit 1
+          fi
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Version must be an exact SemVer-compatible value: $VERSION" >&2
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/package-probe"
+
+          cat > "$RUNNER_TEMP/package-probe/pubspec.yaml" <<EOF
+          name: package_governance_probe
+          publish_to: none
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+
+            ${PACKAGE}: ${VERSION}
+          EOF
+
+          echo "--- probe pubspec.yaml ---"
+          cat "$RUNNER_TEMP/package-probe/pubspec.yaml"
+
+      - name: Configure ingestion registry
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          INGESTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${INGESTION_REPO}/"
+
+          # The token is stored by reference: pub records the env var name, not
+          # the secret. pub-tokens.json lives in the Dart config dir, so it is
+          # unaffected by PUB_CACHE being overridden later.
+          dart pub token add \
+            "$INGESTION_URL" \
+            --env-var CLOUDSMITH_API_KEY
+
+          echo "INGESTION_URL=$INGESTION_URL" >> "$GITHUB_ENV"
+
+      - name: Resolve through ingestion
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export PUB_HOSTED_URL="$INGESTION_URL"
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-ingestion"
+
+          echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+
+          flutter pub get
+          dart pub deps --json > deps.json
+
+      - name: Validate dependency sources
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UNEXPECTED="$(
+            jq -r '
+              .packages[]
+              | select(
+                  .source != "hosted"
+                  and .source != "sdk"
+                  and .source != "root"
+                )
+              | "\(.name)\t\(.version)\t\(.source)"
+            ' deps.json
+          )"
+
+          if [[ -n "$UNEXPECTED" ]]; then
+            echo "Unexpected dependency sources (this POC can only promote hosted packages):" >&2
+            echo "$UNEXPECTED" >&2
+            exit 1
+          fi
+
+          echo "All resolved sources are hosted, sdk or root."
+
+      - name: Build promotion list
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        env:
+          PACKAGE: ${{ inputs.package }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          jq -r '
+            .packages[]
+            | select(.source == "hosted")
+            | [.name, .version]
+            | @tsv
+          ' deps.json \
+            | sort -u \
+            > packages.tsv
+
+          if [[ ! -s packages.tsv ]]; then
+            echo "No hosted packages were resolved." >&2
+            exit 1
+          fi
+
+          if ! awk \
+            -F '\t' \
+            -v package="$PACKAGE" \
+            -v version="$VERSION" \
+            '$1 == package && $2 == version { found=1 } END { exit !found }' \
+            packages.tsv
+          then
+            echo "Requested package/version is not present in the resolved graph." >&2
+            echo "Requested: ${PACKAGE}@${VERSION}" >&2
+            echo "Resolved hosted packages:" >&2
+            cat packages.tsv >&2
+            exit 1
+          fi
+
+          echo "--- packages.tsv ---"
+          cat packages.tsv
+
+      - name: Assert lockfile points at ingestion
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          EXPECTED="https://dart.cloudsmith.io/${NAMESPACE}/${INGESTION_REPO}"
+
+          if ! grep -q "$EXPECTED" pubspec.lock; then
+            echo "pubspec.lock does not reference the ingestion repository." >&2
+            echo "Expected to find: $EXPECTED" >&2
+            exit 1
+          fi
+
+          if grep -qE 'url: "?https://pub\.dev' pubspec.lock; then
+            echo "pubspec.lock references pub.dev directly; ingestion was bypassed." >&2
+            exit 1
+          fi
+
+          echo "Lockfile hosted URLs all point at ${EXPECTED}."
+
+      - name: Write approval summary
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        env:
+          PACKAGE: ${{ inputs.package }}
+          VERSION: ${{ inputs.version }}
+          REASON: ${{ inputs.reason }}
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE_COUNT="$(wc -l < packages.tsv | tr -d ' ')"
+
+          {
+            echo "# Flutter/Dart package ingestion"
+            echo
+            printf '**Requested:** `%s@%s`\n\n' "$PACKAGE" "$VERSION"
+            printf '**Requested by:** `%s`\n\n' "$GITHUB_ACTOR"
+            printf '**Reason:** %s\n\n' "$REASON"
+            printf '**Flutter version:** `%s`\n\n' "${FLUTTER_VERSION:-see setup step}"
+            printf '**Hosted packages to promote:** %s\n\n' "$PACKAGE_COUNT"
+            printf '**From:** `%s/%s`\n\n' "$NAMESPACE" "$INGESTION_REPO"
+            printf '**To:** `%s/%s`\n\n' "$NAMESPACE" "$PRODUCTION_REPO"
+            echo "## Resolved hosted packages"
+            echo
+            echo '```text'
+            cat packages.tsv
+            echo '```'
+            echo
+            echo "Approve the \`cloudsmith-production\` environment to promote this exact graph."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload approval evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-approval-evidence
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/package-probe/pubspec.yaml
+            ${{ runner.temp }}/package-probe/pubspec.lock
+            ${{ runner.temp }}/package-probe/deps.json
+            ${{ runner.temp }}/package-probe/packages.tsv
+
+  promote-and-verify:
+    name: Promote and verify production
+    needs: ingest
+    environment: cloudsmith-production
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download approved evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: package-approval-evidence
+          path: ${{ runner.temp }}/package-probe
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ vars.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Configure Cloudsmith CLI with OIDC
+        uses: cloudsmith-io/cloudsmith-cli-action@v3
+        with:
+          oidc-namespace: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          oidc-service-slug: ${{ vars.CLOUDSMITH_PROMOTION_SERVICE }}
+          oidc-audience: ${{ env.CLOUDSMITH_OIDC_AUDIENCE }}
+          verify-auth: 'true'
+          export-auth-token: 'true'
+
+      - name: Assert Cloudsmith token is available to dart pub
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CLOUDSMITH_API_KEY:-}" ]]; then
+            echo "CLOUDSMITH_API_KEY was not exported by the Cloudsmith action." >&2
+            exit 1
+          fi
+
+          echo "Cloudsmith token is present in the job environment."
+
+      - name: Promote packages
+        shell: bash
+        env:
+          CLOUDSMITH_NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          # Returns the package Unique ID on stdout once the artifact exists in
+          # <repo> and Cloudsmith reports synchronisation as complete.
+          #
+          # Exact-match anchors are mandatory: `name:foo` is a text search and
+          # could select the wrong artifact.
+          wait_for_package_sync() {
+            local repo="$1"
+            local name="$2"
+            local version="$3"
+
+            local query="format:dart AND name:^${name}$ AND version:^${version}$"
+            local result=""
+            local count=0
+            local package_id=""
+            local status=""
+
+            for attempt in $(seq 1 18); do
+              result="$(
+                cloudsmith ls pkg \
+                  "${CLOUDSMITH_NAMESPACE}/${repo}" \
+                  -q "$query" \
+                  -F json
+              )"
+
+              count="$(jq '.data | length' <<< "$result")"
+
+              if [[ "$count" -gt 1 ]]; then
+                echo "Duplicate exact package match: ${name}@${version} in ${repo}" >&2
+                return 1
+              fi
+
+              if [[ "$count" -eq 1 ]]; then
+                package_id="$(
+                  jq -r '.data[0].slug_perm // .data[0].slug' <<< "$result"
+                )"
+
+                if jq -e '
+                  .data[0]
+                  | (.is_sync_completed == true)
+                    or ((.status_str // "") == "Completed")
+                ' >/dev/null <<< "$result"; then
+                  printf '%s\n' "$package_id"
+                  return 0
+                fi
+
+                if jq -e '
+                  .data[0]
+                  | (.is_sync_failed == true)
+                    or ((.status_str // "") == "Failed")
+                ' >/dev/null <<< "$result"; then
+                  echo "Package synchronisation failed: ${name}@${version} in ${repo}" >&2
+                  return 1
+                fi
+
+                # Fallback for CLI/API builds that do not expose the sync
+                # booleans in the package listing.
+                status="$(
+                  cloudsmith status \
+                    "${CLOUDSMITH_NAMESPACE}/${repo}/${package_id}" \
+                    2>/dev/null || true
+                )"
+
+                if grep -q 'Completed' <<< "$status"; then
+                  printf '%s\n' "$package_id"
+                  return 0
+                fi
+
+                if grep -q 'Failed' <<< "$status"; then
+                  echo "Package synchronisation failed: ${name}@${version} in ${repo}" >&2
+                  return 1
+                fi
+              fi
+
+              sleep 10
+            done
+
+            echo "Timed out waiting for ${name}@${version} in ${repo}." >&2
+            echo "Last listing payload:" >&2
+            jq -c '.data' <<< "$result" >&2 || true
+            return 1
+          }
+
+          PROMOTED=0
+          SKIPPED=0
+
+          {
+            echo "# Promotion result"
+            echo
+            echo '| package | version | action |'
+            echo '| --- | --- | --- |'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS=$'\t' read -r NAME VERSION || [[ -n "${NAME:-}" ]]; do
+            [[ -n "${NAME:-}" ]] || continue
+
+            echo "::group::${NAME}@${VERSION}"
+
+            PROD_QUERY="format:dart AND name:^${NAME}$ AND version:^${VERSION}$"
+
+            PROD_RESULT="$(
+              cloudsmith ls pkg \
+                "${CLOUDSMITH_NAMESPACE}/${PRODUCTION_REPO}" \
+                -q "$PROD_QUERY" \
+                -F json
+            )"
+
+            PROD_COUNT="$(jq '.data | length' <<< "$PROD_RESULT")"
+
+            if [[ "$PROD_COUNT" -gt 1 ]]; then
+              echo "Duplicate package in production: ${NAME}@${VERSION}" >&2
+              exit 1
+            fi
+
+            if [[ "$PROD_COUNT" -eq 1 ]]; then
+              wait_for_package_sync \
+                "$PRODUCTION_REPO" \
+                "$NAME" \
+                "$VERSION" \
+                >/dev/null
+
+              echo "Already available in production; skipping copy."
+              printf '| `%s` | `%s` | skipped (already present) |\n' \
+                "$NAME" "$VERSION" >> "$GITHUB_STEP_SUMMARY"
+              SKIPPED=$((SKIPPED + 1))
+              echo "::endgroup::"
+              continue
+            fi
+
+            SOURCE_ID="$(
+              wait_for_package_sync \
+                "$INGESTION_REPO" \
+                "$NAME" \
+                "$VERSION"
+            )"
+
+            echo "Copying ${NAME}@${VERSION} (${SOURCE_ID}) to ${PRODUCTION_REPO}"
+
+            cloudsmith copy \
+              "${CLOUDSMITH_NAMESPACE}/${INGESTION_REPO}/${SOURCE_ID}" \
+              "${PRODUCTION_REPO}"
+
+            wait_for_package_sync \
+              "$PRODUCTION_REPO" \
+              "$NAME" \
+              "$VERSION" \
+              >/dev/null
+
+            printf '| `%s` | `%s` | copied |\n' \
+              "$NAME" "$VERSION" >> "$GITHUB_STEP_SUMMARY"
+            PROMOTED=$((PROMOTED + 1))
+
+            echo "::endgroup::"
+          done < "$RUNNER_TEMP/package-probe/packages.tsv"
+
+          {
+            echo
+            printf '**Copied:** %s  \n' "$PROMOTED"
+            printf '**Skipped:** %s\n' "$SKIPPED"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Promotion finished. copied=${PROMOTED} skipped=${SKIPPED}"
+
+      - name: Point lockfile to production
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          LOCKFILE="$RUNNER_TEMP/package-probe/pubspec.lock"
+
+          # Deliberately written without a trailing slash so the substitution
+          # matches the normalised URL that pub records.
+          INGESTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${INGESTION_REPO}"
+          PRODUCTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${PRODUCTION_REPO}"
+
+          sed -i "s#${INGESTION_URL}#${PRODUCTION_URL}#g" "$LOCKFILE"
+
+          # Only the repository URL may change. Names, versions and content
+          # hashes must stay exactly as approved.
+          if grep -q "$INGESTION_URL" "$LOCKFILE"; then
+            echo "Lockfile still references the ingestion repository." >&2
+            exit 1
+          fi
+
+          if ! grep -q "$PRODUCTION_URL" "$LOCKFILE"; then
+            echo "Lockfile does not reference the production repository." >&2
+            exit 1
+          fi
+
+          echo "Lockfile now resolves against ${PRODUCTION_URL}."
+
+      - name: Configure production registry
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          PRODUCTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${PRODUCTION_REPO}/"
+
+          dart pub token add \
+            "$PRODUCTION_URL" \
+            --env-var CLOUDSMITH_API_KEY
+
+          echo "PRODUCTION_URL=$PRODUCTION_URL" >> "$GITHUB_ENV"
+
+      - name: Verify production
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-production"
+
+          echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+          echo "PUB_CACHE=$PUB_CACHE (empty)"
+
+          # --enforce-lockfile fails if the lockfile is not a valid resolution
+          # of pubspec.yaml, if a required version is unavailable, or if any
+          # hosted package content does not match the approved content hash.
+          flutter pub get --enforce-lockfile
+
+          {
+            echo
+            echo '## Production verification'
+            echo
+            echo 'Resolved the approved lockfile against production only, with an empty PUB_CACHE.'
+            echo
+            echo '```text'
+            echo "flutter pub get --enforce-lockfile  ->  OK"
+            echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

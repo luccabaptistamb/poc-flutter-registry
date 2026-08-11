@@ -1,0 +1,296 @@
+name: Verify Cloudsmith setup
+
+run-name: Verify Cloudsmith setup (${{ vars.CLOUDSMITH_NAMESPACE }})
+
+# Preflight checks for the POC. Validates the Cloudsmith side of the design
+# without promoting anything:
+#
+#   1. GitHub -> Cloudsmith OIDC works for both service identities
+#   2. both repositories are readable
+#   3. flutter-ingestion proxies pub.dev
+#   4. flutter-production has no upstream (Test D of the POC)
+#
+# This workflow is POC support tooling and can be deleted once the flow is
+# validated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      unapproved_package:
+        description: >-
+          A package that must NOT exist in flutter-production, used for the
+          negative test.
+        required: true
+        default: equatable
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CLOUDSMITH_OIDC_AUDIENCE: api.cloudsmith.io
+
+jobs:
+
+  ingestion-identity:
+    name: Ingestion identity and repositories
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ vars.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Report required variables
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+          INGEST_SERVICE: ${{ vars.CLOUDSMITH_INGEST_SERVICE }}
+          PROMOTION_SERVICE: ${{ vars.CLOUDSMITH_PROMOTION_SERVICE }}
+          FLUTTER_VERSION_VAR: ${{ vars.FLUTTER_VERSION }}
+        run: |
+          set -euo pipefail
+
+          MISSING=0
+          for name in NAMESPACE INGESTION_REPO PRODUCTION_REPO \
+                      INGEST_SERVICE PROMOTION_SERVICE FLUTTER_VERSION_VAR; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing repository variable for: $name" >&2
+              MISSING=1
+            else
+              printf '%-22s = %s\n' "$name" "${!name}"
+            fi
+          done
+
+          [[ "$MISSING" -eq 0 ]] || exit 1
+
+          echo "flutter: $(flutter --version | head -1)"
+          echo "dart:    $(dart --version)"
+
+      - name: Configure Cloudsmith CLI with OIDC (ingest identity)
+        uses: cloudsmith-io/cloudsmith-cli-action@v3
+        with:
+          oidc-namespace: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          oidc-service-slug: ${{ vars.CLOUDSMITH_INGEST_SERVICE }}
+          oidc-audience: ${{ env.CLOUDSMITH_OIDC_AUDIENCE }}
+          verify-auth: 'true'
+          export-auth-token: 'true'
+
+      - name: Assert token export
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -n "${CLOUDSMITH_API_KEY:-}" ]] \
+            || { echo "CLOUDSMITH_API_KEY not exported." >&2; exit 1; }
+          [[ -n "${CLOUDSMITH_USERNAME:-}" ]] \
+            || { echo "CLOUDSMITH_USERNAME not exported." >&2; exit 1; }
+
+          echo "Token and username exported by the Cloudsmith action."
+
+      - name: Check read access to both repositories
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          for repo in "$INGESTION_REPO" "$PRODUCTION_REPO"; do
+            COUNT="$(
+              cloudsmith ls pkg "${NAMESPACE}/${repo}" -F json \
+                | jq '.data | length'
+            )"
+            echo "${NAMESPACE}/${repo}: readable, ${COUNT} package(s) listed"
+          done
+
+      - name: Check ingestion proxies pub.dev
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+          PROBE_PACKAGE: ${{ inputs.unapproved_package }}
+        run: |
+          set -euo pipefail
+
+          URL="https://dart.cloudsmith.io/${NAMESPACE}/${INGESTION_REPO}/api/packages/${PROBE_PACKAGE}"
+
+          CODE="$(
+            curl -sS -o /tmp/ingestion.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${CLOUDSMITH_API_KEY}" \
+              "$URL"
+          )"
+
+          echo "GET ingestion/api/packages/${PROBE_PACKAGE} -> HTTP ${CODE}"
+
+          if [[ "$CODE" != "200" ]]; then
+            echo "Ingestion did not serve pub.dev metadata." >&2
+            echo "Expected the pub.dev upstream to be configured as Cache and Proxy." >&2
+            head -c 400 /tmp/ingestion.json >&2 || true
+            exit 1
+          fi
+
+          jq -r '"versions available upstream: \(.versions | length), latest: \(.latest.version)"' \
+            /tmp/ingestion.json
+
+      - name: Check production has no upstream
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+          PROBE_PACKAGE: ${{ inputs.unapproved_package }}
+        run: |
+          set -euo pipefail
+
+          URL="https://dart.cloudsmith.io/${NAMESPACE}/${PRODUCTION_REPO}/api/packages/${PROBE_PACKAGE}"
+
+          CODE="$(
+            curl -sS -o /tmp/production.json -w '%{http_code}' \
+              -H "Authorization: Bearer ${CLOUDSMITH_API_KEY}" \
+              "$URL"
+          )"
+
+          echo "GET production/api/packages/${PROBE_PACKAGE} -> HTTP ${CODE}"
+
+          if [[ "$CODE" == "200" ]]; then
+            echo "Production served metadata for a package that was never promoted." >&2
+            echo "This means flutter-production has an upstream configured. Remove it." >&2
+            exit 1
+          fi
+
+          if [[ "$CODE" != "404" ]]; then
+            echo "Unexpected status from production: ${CODE}" >&2
+            head -c 400 /tmp/production.json >&2 || true
+            exit 1
+          fi
+
+          echo "Production correctly has no metadata for an unapproved package."
+
+      - name: Negative test - unapproved package must not resolve
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+          PROBE_PACKAGE: ${{ inputs.unapproved_package }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$PROBE_PACKAGE" =~ ^[a-z][a-z0-9_]*$ ]]; then
+            echo "Invalid Dart package name: $PROBE_PACKAGE" >&2
+            exit 1
+          fi
+
+          PRODUCTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${PRODUCTION_REPO}/"
+
+          # Guard: the negative test is meaningless if the package was promoted.
+          PRESENT="$(
+            cloudsmith ls pkg "${NAMESPACE}/${PRODUCTION_REPO}" \
+              -q "format:dart AND name:^${PROBE_PACKAGE}$" -F json \
+              | jq '.data | length'
+          )"
+
+          if [[ "$PRESENT" -ne 0 ]]; then
+            echo "'${PROBE_PACKAGE}' already exists in production; pick another package." >&2
+            exit 1
+          fi
+
+          # Authenticate first, so a failure means "not found" and not "401".
+          dart pub token add "$PRODUCTION_URL" --env-var CLOUDSMITH_API_KEY
+
+          mkdir -p "$RUNNER_TEMP/negative-probe"
+
+          cat > "$RUNNER_TEMP/negative-probe/pubspec.yaml" <<EOF
+          name: unapproved_probe
+          publish_to: none
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+
+            ${PROBE_PACKAGE}: any
+          EOF
+
+          cd "$RUNNER_TEMP/negative-probe"
+
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-negative"
+
+          echo "Resolving '${PROBE_PACKAGE}' against production only..."
+
+          if flutter pub get; then
+            echo >&2
+            echo "NEGATIVE TEST FAILED." >&2
+            echo "Production resolved '${PROBE_PACKAGE}', which was never promoted." >&2
+            exit 1
+          fi
+
+          echo
+          echo "NEGATIVE TEST PASSED: production refused to resolve '${PROBE_PACKAGE}'."
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+          PROBE_PACKAGE: ${{ inputs.unapproved_package }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# Cloudsmith setup verification"
+            echo
+            printf '**Result:** `%s`\n\n' "$OUTCOME"
+            printf '**Namespace:** `%s`\n\n' "$NAMESPACE"
+            echo '| check | target |'
+            echo '| --- | --- |'
+            printf '| OIDC (ingest identity) | `%s` |\n' "${{ vars.CLOUDSMITH_INGEST_SERVICE }}"
+            printf '| repository readable | `%s/%s` |\n' "$NAMESPACE" "$INGESTION_REPO"
+            printf '| repository readable | `%s/%s` |\n' "$NAMESPACE" "$PRODUCTION_REPO"
+            printf '| ingestion proxies pub.dev | `%s` |\n' "$PROBE_PACKAGE"
+            printf '| production has no upstream | `%s` |\n' "$PROBE_PACKAGE"
+            printf '| negative test (pub get) | `%s` |\n' "$PROBE_PACKAGE"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promotion-identity:
+    name: Promotion identity
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure Cloudsmith CLI with OIDC (promotion identity)
+        uses: cloudsmith-io/cloudsmith-cli-action@v3
+        with:
+          oidc-namespace: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          oidc-service-slug: ${{ vars.CLOUDSMITH_PROMOTION_SERVICE }}
+          oidc-audience: ${{ env.CLOUDSMITH_OIDC_AUDIENCE }}
+          verify-auth: 'true'
+          export-auth-token: 'true'
+
+      - name: Check the promotion identity can read both repositories
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          for repo in "$INGESTION_REPO" "$PRODUCTION_REPO"; do
+            cloudsmith ls pkg "${NAMESPACE}/${repo}" -F json >/dev/null
+            echo "${NAMESPACE}/${repo}: readable by the promotion identity"
+          done
+
+          echo
+          echo "Note: the 'Copy packages' privilege can only be validated by an"
+          echo "actual promotion run, which happens in ingest-package.yml."

@@ -176,6 +176,7 @@ jobs:
         shell: bash
         env:
           NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
           PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
           PROBE_PACKAGE: ${{ inputs.unapproved_package }}
         run: |
@@ -187,6 +188,7 @@ jobs:
           fi
 
           PRODUCTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${PRODUCTION_REPO}/"
+          INGESTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${INGESTION_REPO}/"
 
           # Guard: the negative test is meaningless if the package was promoted.
           PRESENT="$(
@@ -202,6 +204,7 @@ jobs:
 
           # Authenticate first, so a failure means "not found" and not "401".
           dart pub token add "$PRODUCTION_URL" --env-var CLOUDSMITH_API_KEY
+          dart pub token add "$INGESTION_URL" --env-var CLOUDSMITH_API_KEY
 
           mkdir -p "$RUNNER_TEMP/negative-probe"
 
@@ -221,8 +224,16 @@ jobs:
 
           cd "$RUNNER_TEMP/negative-probe"
 
-          export PUB_HOSTED_URL="$PRODUCTION_URL"
           export PUB_CACHE="$RUNNER_TEMP/pub-cache-negative"
+
+          # Bootstrap the Flutter tool through ingestion. The tool resolves its
+          # own package graph (flutter_tools) into PUB_CACHE, and it needs
+          # packages such as `test` that are never promoted. Without this the
+          # resolution below would fail on flutter_tools instead of on the
+          # unapproved package, passing the test for the wrong reason.
+          PUB_HOSTED_URL="$INGESTION_URL" flutter --version >/dev/null
+
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
 
           echo "Resolving '${PROBE_PACKAGE}' against production only..."
 

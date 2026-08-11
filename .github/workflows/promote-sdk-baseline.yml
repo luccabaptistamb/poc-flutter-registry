@@ -284,7 +284,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: sdk-baseline-evidence
-          path: ${{ runner.temp }}/baseline
+          # The artifact spans two directories, so it keeps its structure:
+          # evidence/baseline/*.tsv and evidence/sdk-probe/*.
+          path: ${{ runner.temp }}/evidence
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -310,9 +312,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          bash scripts/promote-packages.sh \
-            "$RUNNER_TEMP/baseline/sdk-baseline.tsv" \
-            "SDK baseline"
+          BASELINE="$RUNNER_TEMP/evidence/baseline/sdk-baseline.tsv"
+
+          [[ -s "$BASELINE" ]] || {
+            echo "Baseline list not found at $BASELINE" >&2
+            find "$RUNNER_TEMP/evidence" -type f >&2
+            exit 1
+          }
+
+          bash scripts/promote-packages.sh "$BASELINE" "SDK baseline"
 
       - name: Configure production registry
         shell: bash

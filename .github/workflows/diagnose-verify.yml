@@ -1,0 +1,180 @@
+name: Diagnose production verification
+
+# Temporary diagnostic for the 'Verify production' failure:
+#   Because flutter_tools depends on test any which doesn't exist
+#
+# production already contains the 16 approved packages, so any failure here is
+# about how pub resolves, not about missing artifacts.
+#
+# Delete this workflow once the verification step is fixed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      evidence_run_id:
+        description: Run ID that produced package-approval-evidence
+        required: true
+        default: '31530982113'
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  actions: read
+
+env:
+  CLOUDSMITH_OIDC_AUDIENCE: api.cloudsmith.io
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download approved evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: package-approval-evidence
+          path: ${{ runner.temp }}/package-probe
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ vars.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Configure Cloudsmith CLI with OIDC
+        uses: cloudsmith-io/cloudsmith-cli-action@v3
+        with:
+          oidc-namespace: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          oidc-service-slug: ${{ vars.CLOUDSMITH_PROMOTION_SERVICE }}
+          oidc-audience: ${{ env.CLOUDSMITH_OIDC_AUDIENCE }}
+          verify-auth: 'true'
+          export-auth-token: 'true'
+
+      - name: Inspect the Flutter SDK layout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "FLUTTER_ROOT=$FLUTTER_ROOT"
+          echo "default PUB_CACHE=${PUB_CACHE:-unset}"
+          echo
+
+          echo "::group::FLUTTER_ROOT/pubspec.yaml"
+          if [[ -f "$FLUTTER_ROOT/pubspec.yaml" ]]; then
+            cat "$FLUTTER_ROOT/pubspec.yaml" | head -100
+          else
+            echo "absent"
+          fi
+          echo "::endgroup::"
+
+          echo "::group::packages/flutter/pubspec.yaml (resolution field)"
+          grep -nE '^(name|resolution|environment)' \
+            "$FLUTTER_ROOT/packages/flutter/pubspec.yaml" || true
+          echo "::endgroup::"
+
+          echo "::group::packages/flutter_tools/pubspec.yaml"
+          grep -nE '^(name|resolution)|^\s+test:' \
+            "$FLUTTER_ROOT/packages/flutter_tools/pubspec.yaml" || true
+          echo "::endgroup::"
+
+          echo "::group::flutter_tools .dart_tool"
+          TOOLCFG="$FLUTTER_ROOT/packages/flutter_tools/.dart_tool/package_config.json"
+          if [[ -f "$TOOLCFG" ]]; then
+            echo "package_config.json exists"
+            jq -r '.packages | length | "packages: \(.)"' "$TOOLCFG"
+            jq -r '[.packages[].rootUri | select(startswith("file:"))][0] // "no absolute rootUri"' "$TOOLCFG"
+          else
+            echo "package_config.json ABSENT -> flutter will bootstrap flutter_tools"
+          fi
+          ls "$FLUTTER_ROOT/bin/cache/" | head -20
+          echo "::endgroup::"
+
+      - name: Configure pub registries
+        shell: bash
+        env:
+          NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
+          INGESTION_REPO: ${{ vars.CLOUDSMITH_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.CLOUDSMITH_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          PRODUCTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${PRODUCTION_REPO}/"
+          INGESTION_URL="https://dart.cloudsmith.io/${NAMESPACE}/${INGESTION_REPO}/"
+
+          dart pub token add "$PRODUCTION_URL" --env-var CLOUDSMITH_API_KEY
+          dart pub token add "$INGESTION_URL" --env-var CLOUDSMITH_API_KEY
+
+          echo "PRODUCTION_URL=$PRODUCTION_URL" >> "$GITHUB_ENV"
+          echo "INGESTION_URL=$INGESTION_URL" >> "$GITHUB_ENV"
+
+      - name: A - flutter pub get, fresh cache, production only
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          export PUB_CACHE="$RUNNER_TEMP/cache-a"
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+
+          flutter pub get --enforce-lockfile 2>&1 | head -40
+          echo "exit=${PIPESTATUS[0]}"
+
+      - name: B - dart pub get, fresh cache, production only
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          export PUB_CACHE="$RUNNER_TEMP/cache-b"
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+
+          # dart pub can resolve `sdk: flutter` dependencies as long as
+          # FLUTTER_ROOT is set, and it does not run the flutter_tools
+          # bootstrap that the flutter wrapper performs.
+          dart pub get --enforce-lockfile 2>&1 | head -40
+          echo "exit=${PIPESTATUS[0]}"
+
+      - name: C - flutter pub get, default cache, production only
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # Keep the runner's warm PUB_CACHE, which already contains the
+          # flutter_tools toolchain.
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+
+          flutter pub get --enforce-lockfile 2>&1 | head -40
+          echo "exit=${PIPESTATUS[0]}"
+
+      - name: D - verbose resolution to identify the trigger
+        continue-on-error: true
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          export PUB_CACHE="$RUNNER_TEMP/cache-d"
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+
+          flutter pub get --enforce-lockfile -v 2>&1 \
+            | grep -iE 'flutter_tools|workspace|pub get|Resolving|solving|test |sdk' \
+            | head -60
+          echo "exit=${PIPESTATUS[0]}"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "# Verification diagnosis"
+            echo
+            echo 'See the step outputs: A (flutter+fresh cache), B (dart+fresh cache),'
+            echo 'C (flutter+warm cache), D (verbose).'
+          } >> "$GITHUB_STEP_SUMMARY"

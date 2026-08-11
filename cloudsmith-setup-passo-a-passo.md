@@ -445,6 +445,31 @@ claims:
 
 ---
 
+### 9.6. Endpoint de exchange e o que a mensagem de erro não diz
+
+O exchange acontece em:
+
+```text
+POST https://api.cloudsmith.io/openid/<namespace>/
+Content-Type: application/json
+
+{"oidc_token": "<github-jwt>", "service_slug": "<service-account-slug>"}
+```
+
+Em caso de falha a resposta é sempre:
+
+```json
+{"detail": "Failed to validate token"}
+```
+
+Essa resposta é **idêntica** para provider inexistente, `iss` divergente, claim divergente, service account não anexado, provider desabilitado e token forjado — verificado enviando um JWT falso ao endpoint, que retorna exatamente o mesmo `401`.
+
+Consequência prática: a mensagem não serve para diagnóstico. O caminho eficiente é comparar os claims configurados com os claims do token real (9.5), campo por campo.
+
+O audience **não** participa da validação quando `aud` não é declarado nos claims — verificado emitindo tokens com quatro audiences diferentes (`api.cloudsmith.io`, `https://github.com/<owner>`, `cloudsmith`, `https://api.cloudsmith.io`), todos com resultado idêntico.
+
+---
+
 ## 10. Passo 9 — Validação do setup Cloudsmith
 
 Checagens que podem ser feitas antes de rodar a workflow completa.
@@ -558,6 +583,7 @@ FLUTTER_VERSION             = <versão do ecossistema alvo>
 
 | Sintoma | Causa provável | Ação |
 |---|---|---|
+| `OIDC token exchange failed with 401: Failed to validate token` | **qualquer** problema do provider: `iss` divergente, claim divergente, service account não anexado, provider desabilitado — a mensagem é idêntica nos quatro casos, e também para um token inteiramente inválido | comparar os claims do provider **caractere a caractere** com o token real (9.5). O erro mais fácil de cometer é digitar o nome do repository de memória |
 | `verify-auth` falha na Action | Provider URL ≠ `iss` | reconfirmar `iss` real (seção 9.4) e testar com/sem trailing slash |
 | `verify-auth` falha com claims corretos | claim declarado que o token não possui (ex. `aud` errado) | remover o claim extra; claims são avaliados em AND |
 | Exchange OIDC autoriza mas sem acesso ao repo | service account sem privilege | Passo 6 |

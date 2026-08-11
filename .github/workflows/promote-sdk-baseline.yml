@@ -189,17 +189,22 @@ jobs:
             exit 1
           fi
 
-          # One version per package. Two versions of the same package in the
-          # baseline would mean the two resolutions disagreed, which needs a
-          # human decision rather than a silent promotion of both.
-          DUPES="$(cut -f1 sdk-baseline.tsv | sort | uniq -d)"
+          # The two resolutions are independent, so the same package can legitimately
+          # appear in more than one version: the toolchain and the application-facing
+          # SDK graph have different constraints. A flat registry holds both and pub
+          # picks per project, so both are promoted. Recorded because it is worth
+          # seeing during review.
+          : > multi-version.txt
 
-          if [[ -n "$DUPES" ]]; then
-            echo "The same package resolved to more than one version:" >&2
-            for name in $DUPES; do
-              grep -P "^${name}\t" sdk-baseline.tsv >&2
-            done
-            exit 1
+          for name in $(cut -f1 sdk-baseline.tsv | sort | uniq -d); do
+            grep -P "^${name}\t" sdk-baseline.tsv >> multi-version.txt
+          done
+
+          if [[ -s multi-version.txt ]]; then
+            echo "Packages present in more than one version:"
+            cat multi-version.txt
+          else
+            echo "Every package resolved to a single version."
           fi
 
           echo "baseline packages: $(wc -l < sdk-baseline.tsv)"
@@ -227,6 +232,17 @@ jobs:
             printf '**flutter_tools graph:** %s packages\n\n' "$(wc -l < toolchain.tsv)"
             printf '**SDK-provided graph:** %s packages\n\n' "$(wc -l < sdk-packages.tsv)"
             printf '**Baseline total (union):** %s packages\n\n' "$(wc -l < sdk-baseline.tsv)"
+            if [[ -s multi-version.txt ]]; then
+              printf '**Packages in more than one version:** %s\n\n' "$(wc -l < multi-version.txt)"
+              echo '```text'
+              cat multi-version.txt
+              echo '```'
+              echo
+              echo "The toolchain and the application-facing SDK graph resolve"
+              echo "independently, so both versions are promoted and pub picks per"
+              echo "project."
+              echo
+            fi
             echo "> Every package in production is implicitly approved for use."
             echo "> This baseline exists so that \`flutter pub get\` works against"
             echo "> production alone. Review it as a set, and re-run after an SDK"
@@ -249,6 +265,7 @@ jobs:
             ${{ runner.temp }}/baseline/toolchain.tsv
             ${{ runner.temp }}/baseline/sdk-packages.tsv
             ${{ runner.temp }}/baseline/sdk-baseline.tsv
+            ${{ runner.temp }}/baseline/multi-version.txt
             ${{ runner.temp }}/sdk-probe/pubspec.yaml
             ${{ runner.temp }}/sdk-probe/pubspec.lock
             ${{ runner.temp }}/sdk-probe/deps.json

@@ -23,6 +23,9 @@ jobs:
           NAMESPACE: ${{ vars.CLOUDSMITH_NAMESPACE }}
           SERVICE_SLUG: ${{ vars.CLOUDSMITH_INGEST_SERVICE }}
         run: |
+          # The runner invokes bash with -e; disable it so every audience is
+          # attempted even when one of them fails.
+          set +e
           set -uo pipefail
 
           ENDPOINT="https://api.cloudsmith.io/openid/${NAMESPACE}/"
@@ -63,13 +66,12 @@ jobs:
             fi
 
             # Print only non-secret claims, never the token.
-            local payload
-            payload="$(
-              cut -d. -f2 <<< "$token" \
-                | tr '_-' '/+' \
-                | base64 -d 2>/dev/null
-            )"
-            echo "claims sent: $(jq -c '{iss, aud, repository, ref}' <<< "$payload")"
+            # base64 -d needs correct padding, which JWT segments omit.
+            local segment payload
+            segment="$(cut -d. -f2 <<< "$token" | tr '_-' '/+')"
+            while (( ${#segment} % 4 )); do segment="${segment}="; done
+            payload="$(base64 -d <<< "$segment" 2>/dev/null)"
+            echo "claims sent: $(jq -c '{iss, aud, repository, ref}' <<< "$payload" 2>/dev/null)"
 
             local code body
             code="$(

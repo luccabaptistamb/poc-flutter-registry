@@ -89,6 +89,62 @@ erro deixa o repositório em `AUTO_BLOCKED_UNAVAILABLE`. Depois de corrigir
 qualquer coisa de rede é obrigatório invalidar o cache e esperar o bloqueio
 expirar, senão parece que nada melhorou. O bootstrap usa TTL de 5 minutos.
 
+## Equivalência Cloudsmith → Nexus CE
+
+Base para o Plano 2. O que muda não é a arquitetura, são três mecanismos:
+
+| Conceito | Cloudsmith | Nexus CE |
+|---|---|---|
+| Repo de entrada | `flutter-ingestion`, upstream `pub.dev` em Cache and Proxy | `pub-ingestion`, pub proxy com remote `https://pub.dev` |
+| Repo aprovado | `flutter-production`, sem upstream | `pub-production`, pub hosted |
+| Privacidade | `Visibility: Private` (opt-in) | acesso anônimo desabilitado (**opt-out**) |
+| Identidade de CI | OIDC, token temporário, claims `repository` + `ref` | credencial estática (usuário/senha) |
+| Auth do cliente pub | `dart pub token add --env-var CLOUDSMITH_API_KEY` | idem, com token = `base64(user:senha)` e realm `PubToken` ativo |
+| **Promoção** | `cloudsmith copy <ns>/<repo>/<id> <dest>` | **download do proxy + `POST /v1/components`** |
+| Espera de sync | `cloudsmith ls pkg` + `is_sync_completed` | não observado; o upload é síncrono |
+| Imutabilidade | — | `writePolicy: ALLOW_ONCE` no hosted |
+| Busca exata | `name:^x$ AND version:^y$` | `GET /api/packages/<name>` + filtro por versão |
+| Identificador | `slug_perm` | `name` + `version` explícitos no upload |
+
+O ponto mais delicado da tradução é a identidade: perde-se expiração automática e
+o vínculo com `repository`/`ref`. Mitigação principal, sem custo: a credencial de
+promoção como **Environment secret** do `cloudsmith-production`, não repository
+secret, de modo que o job de ingestão não consiga lê-la. O gate de aprovação
+passa a ser o que dá acesso à credencial, com enforcement do GitHub.
+
+## Registro de decisões e ações
+
+**EULA do CE aceita em 2026-08-12** durante a implementação do Plano 1, para
+desbloquear a validação, com opt-in explícito (`NEXUS_ACCEPT_EULA=yes`). É um
+acordo jurídico e o contexto é corporativo: se houver processo de revisão
+interna, este é o item a levar. https://links.sonatype.com/products/nxrm/ce-eula
+
+**Escolhido o conjunto mínimo em vez do Pro.** `cloudsmith copy` não tem
+equivalente em CE, e a alternativa avaliada seria o Staging do Pro. Descartada
+porque download + upload preserva o `sha256`, que é a única propriedade que o
+modelo de evidência exige.
+
+## Ambiente: proxy do Docker Desktop malformado
+
+Independente do Nexus, e vai reaparecer. O proxy do Docker Desktop nesta máquina
+falha assim:
+
+```text
+connecting to http=127.0.0.1:8380: dial tcp: lookup http=127.0.0.1: no such host
+```
+
+O valor está na sintaxe legada do WinINET (`http=host:port;https=...`) e o Docker
+Desktop trata a string inteira como hostname. Não está no `settings-store.json`,
+então vem do proxy de sistema do Windows — provavelmente posto pelo agente
+corporativo. Sintomas observados:
+
+- o primeiro `docker pull` falhou; o segundo funcionou (intermitente);
+- `http://http.docker.internal:3128` responde `HTTP/1.0 500` com o erro acima.
+
+Não foi alterado: é configuração da máquina do usuário. O contorno aplicado foi
+dar ao Nexus o CA interceptador, o que resolve o egress do Nexus mas não o do
+`docker pull`.
+
 ## Limites e lacunas conhecidos
 
 **Teto do CE: 40.000 componentes e 100.000 requests/dia.** A POC usa poucos, mas

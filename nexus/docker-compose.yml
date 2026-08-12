@@ -1,0 +1,59 @@
+# Local Sonatype Nexus Repository for the pub governance POC.
+#
+#   docker compose -f nexus/docker-compose.yml up -d
+#   docker compose -f nexus/docker-compose.yml logs -f nexus
+#
+# First start takes 2-3 minutes. The initial admin password is generated inside
+# the volume at /nexus-data/admin.password.
+#
+# The version is pinned rather than using `latest`, for the same reason third
+# party Actions get pinned: an upgrade should be a deliberate change, especially
+# while we are establishing what Community Edition can and cannot do.
+
+name: nexus-pub-poc
+
+services:
+  nexus:
+    image: sonatype/nexus3:3.95.0
+    container_name: nexus
+    restart: unless-stopped
+
+    ports:
+      - "8081:8081"
+
+    environment:
+      # Community Edition default heap. -Xms and -Xmx must match, and
+      # java.util.prefs.userRoot must live in the volume so that state survives
+      # a container recreate.
+      INSTALL4J_ADD_VM_PARAMS: >-
+        -Xms2703m
+        -Xmx2703m
+        -XX:MaxDirectMemorySize=2703m
+        -Djava.util.prefs.userRoot=/nexus-data/javaprefs
+
+    volumes:
+      - nexus-data:/nexus-data
+
+    # The databases need time to shut down cleanly; the image documentation is
+    # explicit about this.
+    stop_grace_period: 120s
+
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/service/rest/v1/status"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 60s
+
+    networks:
+      - nexus
+
+networks:
+  # Named so that throwaway dart containers can resolve the instance as
+  # http://nexus:8081 without depending on the host network.
+  nexus:
+    name: nexus-pub-poc
+
+volumes:
+  nexus-data:
+    name: nexus-pub-poc-data

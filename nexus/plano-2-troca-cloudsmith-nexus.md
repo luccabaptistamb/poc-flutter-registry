@@ -49,6 +49,19 @@ Requisitos:
 - controle de acesso no próprio túnel (service token). Um Nexus com credencial
   estática exposto na internet é superfície demais.
 
+**Decidido: Tailscale.** O hostname será o MagicDNS do nó que roda o Nexus, com
+HTTPS por certificado do Tailscale. Consequências aceitas:
+
+- o acesso é controlado pela própria tailnet, o que resolve o requisito de
+  controle de acesso sem expor nada na internet pública;
+- **o runner precisa entrar na tailnet.** Runner hospedado do GitHub exige o
+  `tailscale/github-action` com um auth key ou OAuth client, e o nó do runner é
+  efêmero — usar tag ACL própria e chave efêmera;
+- o hostname é o da tailnet, não o do deploy definitivo. Os lockfiles aprovados
+  na POC valem só para a POC; a evidência será regerada quando o Nexus tiver o
+  endereço final. Custo aceito porque a POC prova o desenho, não produz o
+  inventário aprovado de verdade.
+
 ### Verificações da fase
 
 **1. Base URL do Nexus.** O `archive_url` observado no Plano 1 é derivado da
@@ -80,7 +93,14 @@ de metadata e um download do arquivo.
 | Variable | `NEXUS_PRODUCTION_REPO` | `pub-production` |
 | Variable | `FLUTTER_VERSION` | `3.44.9` |
 | **Repository** secret | `NEXUS_INGEST_TOKEN` | `base64(ci-ingestion:senha)` |
+| **Repository** secret | `NEXUS_CONSUMER_TOKEN` | `base64(pub-consumer:senha)` |
 | **Environment** secret | `NEXUS_PROMOTION_TOKEN` | `base64(ci-promotion:senha)` |
+
+O `NEXUS_CONSUMER_TOKEN` não estava previsto e foi acrescentado na Fase 3: o
+teste negativo precisa da identidade **read-only em production** que um developer
+ou um build de aplicação tem. Com o token de ingestão, production responde 403 em
+vez de 404 e o teste passaria pelo motivo errado; com o de promoção, o
+`verify-setup` passaria a exigir aprovação.
 
 A distinção repository/environment é central, não conveniência: secrets de
 Environment só são injetados em jobs que declaram `environment:`, e esse job só
@@ -212,25 +232,73 @@ de rede.
 
 ---
 
+## Estado da implementação
+
+**Fase 2 concluída e validada contra `localhost:8081`** em 2026-08-19.
+`scripts/nexus-promote-packages.sh`, mesma interface do script do Cloudsmith.
+Evidência da validação:
+
+```text
+3 packages   promoted=2 skipped=1     (path já estava em production)
+reexecução   promoted=0 skipped=3
+10 packages  promoted=10 em 4s        (inclui analyzer e dwds, loopback)
+versão inexistente        exit 1, nada enviado
+token de ingestão         exit 1 no primeiro read de production (403)
+```
+
+Uma correção em relação ao plano: o upload **não** aceita `Bearer`. Ver o item 5
+do `nexus/README.md`. O script usa `Authorization: Basic` em todas as chamadas,
+com o mesmo valor de token.
+
+**Fase 3 concluída como arquivos paralelos**, não substituição:
+
+```text
+.github/workflows/nexus-ingest-package.yml
+.github/workflows/nexus-promote-sdk-baseline.yml
+.github/workflows/nexus-verify-setup.yml
+```
+
+As três workflows do Cloudsmith continuam intactas, então a POC original segue
+executável para comparação. Trocar por substituição é um `git mv` depois de a
+Fase 4 passar.
+
+Duas decisões tomadas na migração:
+
+- **o Environment continua sendo `cloudsmith-production`.** O nome ficou
+  impróprio, mas é o gate que já existe com reviewer configurado; renomear é
+  cosmético e invalidaria a configuração atual;
+- **o isolamento da credencial é verificado, não presumido.** O job de ingestão
+  referencia `secrets.NEXUS_PROMOTION_TOKEN` e **falha se ele tiver valor**. Como
+  Environment secrets não são injetados em job sem `environment:`, isso
+  transforma o item de checklist "confirmado que o job de ingestão não lê o secret
+  de promoção" em asserção automática.
+
+Falta a Fase 0 (túnel), a Fase 1 (criar as variables e secrets no GitHub) e a
+Fase 4. Nada do lado do cliente pub foi exercitado ainda: `dart pub token add`
+exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
+
+---
+
 ## Checklist
 
 ### Fase 2 — promoção local
 
-- [ ] `scripts/nexus-promote-packages.sh` criado com a interface `<tsv> [label]`
-- [ ] skip de versão já existente em production
-- [ ] download via `archive_url` da metadata do ingestion
-- [ ] upload via components API com `pub.name`/`pub.version`/`pub.asset`
-- [ ] `sha256` conferido após cada upload
-- [ ] validado contra `localhost:8081` com um TSV de 3 packages
-- [ ] reexecução resulta em todos `skipped`
+- [x] `scripts/nexus-promote-packages.sh` criado com a interface `<tsv> [label]`
+- [x] skip de versão já existente em production
+- [x] download via `archive_url` da metadata do ingestion
+- [x] upload via components API com `pub.name`/`pub.version`/`pub.asset`
+- [x] `sha256` conferido após cada upload
+- [x] validado contra `localhost:8081` com um TSV de 3 packages
+- [x] reexecução resulta em todos `skipped`
 
 ### Fase 0 — exposição
 
-- [ ] túnel com hostname estável e TLS
-- [ ] hostname escolhido é o do deploy definitivo (ou aceito o custo de regerar)
-- [ ] controle de acesso no túnel
-- [ ] Base URL do Nexus coerente com o túnel
-- [ ] `archive_url` reescrito para o hostname do túnel, confirmado por GET
+- [x] provedor escolhido: Tailscale com MagicDNS
+- [ ] Nexus alcançável pelo hostname MagicDNS com HTTPS
+- [ ] runner hospedado entra na tailnet (chave efêmera + tag ACL própria)
+- [ ] aceito o custo de regerar a evidência quando o hostname definitivo existir
+- [ ] Base URL do Nexus coerente com o hostname da tailnet
+- [ ] `archive_url` reescrito para esse hostname, confirmado por GET
 - [ ] download de arquivo funciona pelo túnel
 - [ ] `dart pub token add` aceita a URL (HTTPS)
 
@@ -238,17 +306,19 @@ de rede.
 
 - [ ] 4 repository variables criadas
 - [ ] `NEXUS_INGEST_TOKEN` como repository secret
+- [ ] `NEXUS_CONSUMER_TOKEN` como repository secret
 - [ ] `NEXUS_PROMOTION_TOKEN` como **Environment** secret
-- [ ] confirmado que o job de ingestão não lê o secret de promoção
+- [x] confirmado que o job de ingestão não lê o secret de promoção
+      (asserção automática nos jobs sem `environment:`)
 - [ ] Environment com required reviewer mantido
 
 ### Fase 3 — workflows
 
-- [ ] `ingest-package.yml` migrado
-- [ ] `verify-setup.yml` migrado
-- [ ] `promote-sdk-baseline.yml` migrado
-- [ ] `permissions: id-token: write` removido
-- [ ] `sed` do lockfile com o novo par de URLs
+- [x] `ingest-package.yml` migrado (`nexus-ingest-package.yml`)
+- [x] `verify-setup.yml` migrado (`nexus-verify-setup.yml`)
+- [x] `promote-sdk-baseline.yml` migrado (`nexus-promote-sdk-baseline.yml`)
+- [x] `permissions: id-token: write` removido
+- [x] `sed` do lockfile com o novo par de URLs
 
 ### Fase 4 — validação
 

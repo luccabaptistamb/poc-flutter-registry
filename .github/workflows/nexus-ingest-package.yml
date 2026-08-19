@@ -1,0 +1,499 @@
+name: Ingest Flutter/Dart package (Nexus)
+
+run-name: >-
+  Ingest ${{ inputs.package }}@${{ inputs.version }}
+  requested by ${{ github.actor }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: Package name (exact, lowercase Dart package name)
+        required: true
+        type: string
+
+      version:
+        description: Exact package version (no ranges, no carets)
+        required: true
+        type: string
+
+      reason:
+        description: Reason for adoption
+        required: true
+        type: string
+
+# No `id-token: write`: Nexus has no OIDC in any edition, so CI authenticates
+# with a static credential. What replaces the OIDC claim binding is where the
+# credential lives: the promotion token is an Environment secret, so it only
+# exists in a job that declared the environment, and that job only starts after
+# the approval.
+permissions:
+  contents: read
+
+jobs:
+
+  ingest:
+    name: Resolve through ingestion
+    runs-on: ubuntu-latest
+
+    env:
+      NEXUS_TOKEN: ${{ secrets.NEXUS_INGEST_TOKEN }}
+
+    steps:
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ vars.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Assert credential isolation
+        shell: bash
+        env:
+          PROMOTION_TOKEN: ${{ secrets.NEXUS_PROMOTION_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${NEXUS_TOKEN:-}" ]]; then
+            echo "NEXUS_INGEST_TOKEN repository secret is not set." >&2
+            echo "Expected base64(user:password) for the ingestion identity." >&2
+            exit 1
+          fi
+
+          # NEXUS_PROMOTION_TOKEN must be an Environment secret of
+          # cloudsmith-production, not a repository secret. This job declares no
+          # environment, so it must resolve to nothing. If it has a value here,
+          # the ingestion job can write to production without approval and the
+          # gate is decorative.
+          if [[ -n "${PROMOTION_TOKEN:-}" ]]; then
+            echo "The promotion token is readable by the ingestion job." >&2
+            echo "Move NEXUS_PROMOTION_TOKEN to the cloudsmith-production Environment" >&2
+            echo "and delete the repository secret with the same name." >&2
+            exit 1
+          fi
+
+          echo "Ingestion token present; promotion token not readable here."
+
+      - name: Create dependency probe
+        shell: bash
+        env:
+          PACKAGE: ${{ inputs.package }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$PACKAGE" =~ ^[a-z][a-z0-9_]*$ ]]; then
+            echo "Invalid Dart package name: $PACKAGE" >&2
+            exit 1
+          fi
+
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Version must be an exact SemVer-compatible value: $VERSION" >&2
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/package-probe"
+
+          cat > "$RUNNER_TEMP/package-probe/pubspec.yaml" <<EOF
+          name: package_governance_probe
+          publish_to: none
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+
+            ${PACKAGE}: ${VERSION}
+          EOF
+
+          echo "--- probe pubspec.yaml ---"
+          cat "$RUNNER_TEMP/package-probe/pubspec.yaml"
+
+      - name: Configure ingestion registry
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          # `dart pub token add` refuses a non-HTTPS URL, so TLS on the Nexus
+          # endpoint is a functional requirement, not only a security one.
+          INGESTION_URL="${BASE_URL%/}/repository/${INGESTION_REPO}/"
+
+          # The token is stored by reference: pub records the env var name, not
+          # the secret. The value is base64(user:password) and is accepted by
+          # Nexus because the PubToken realm is active.
+          dart pub token add \
+            "$INGESTION_URL" \
+            --env-var NEXUS_TOKEN
+
+          echo "INGESTION_URL=$INGESTION_URL" >> "$GITHUB_ENV"
+
+      - name: Resolve through ingestion
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # A dedicated PUB_CACHE prevents a package already present in the
+          # runner's default cache from masking a problem in the registry.
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-ingestion"
+          export PUB_HOSTED_URL="$INGESTION_URL"
+
+          echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+
+          # The Flutter tool bootstraps its own package graph (flutter_tools)
+          # into PUB_CACHE, which also goes through the ingestion registry.
+          # Those packages are cached in the proxy but are not part of the probe
+          # graph, so they are never promoted.
+          flutter --version >/dev/null
+
+          flutter pub get
+          dart pub deps --json > deps.json
+
+      - name: Validate dependency sources
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UNEXPECTED="$(
+            jq -r '
+              .packages[]
+              | select(
+                  .source != "hosted"
+                  and .source != "sdk"
+                  and .source != "root"
+                )
+              | "\(.name)\t\(.version)\t\(.source)"
+            ' deps.json
+          )"
+
+          if [[ -n "$UNEXPECTED" ]]; then
+            echo "Unexpected dependency sources (this POC can only promote hosted packages):" >&2
+            echo "$UNEXPECTED" >&2
+            exit 1
+          fi
+
+          echo "All resolved sources are hosted, sdk or root."
+
+      - name: Build promotion list
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        env:
+          PACKAGE: ${{ inputs.package }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          jq -r '
+            .packages[]
+            | select(.source == "hosted")
+            | [.name, .version]
+            | @tsv
+          ' deps.json \
+            | sort -u \
+            > packages.tsv
+
+          if [[ ! -s packages.tsv ]]; then
+            echo "No hosted packages were resolved." >&2
+            exit 1
+          fi
+
+          if ! awk \
+            -F '\t' \
+            -v package="$PACKAGE" \
+            -v version="$VERSION" \
+            '$1 == package && $2 == version { found=1 } END { exit !found }' \
+            packages.tsv
+          then
+            echo "Requested package/version is not present in the resolved graph." >&2
+            echo "Requested: ${PACKAGE}@${VERSION}" >&2
+            echo "Resolved hosted packages:" >&2
+            cat packages.tsv >&2
+            exit 1
+          fi
+
+          echo "--- packages.tsv ---"
+          cat packages.tsv
+
+      - name: Assert lockfile points at ingestion
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          EXPECTED="${BASE_URL%/}/repository/${INGESTION_REPO}"
+
+          if ! grep -q "$EXPECTED" pubspec.lock; then
+            echo "pubspec.lock does not reference the ingestion repository." >&2
+            echo "Expected to find: $EXPECTED" >&2
+            exit 1
+          fi
+
+          if grep -qE 'url: "?https://pub\.dev' pubspec.lock; then
+            echo "pubspec.lock references pub.dev directly; ingestion was bypassed." >&2
+            exit 1
+          fi
+
+          echo "Lockfile hosted URLs all point at ${EXPECTED}."
+
+      - name: Write approval summary
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        env:
+          PACKAGE: ${{ inputs.package }}
+          VERSION: ${{ inputs.version }}
+          REASON: ${{ inputs.reason }}
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          PACKAGE_COUNT="$(wc -l < packages.tsv | tr -d ' ')"
+
+          {
+            echo "# Flutter/Dart package ingestion"
+            echo
+            printf '**Requested:** `%s@%s`\n\n' "$PACKAGE" "$VERSION"
+            printf '**Requested by:** `%s`\n\n' "$GITHUB_ACTOR"
+            printf '**Reason:** %s\n\n' "$REASON"
+            printf '**Flutter version:** `%s`\n\n' "${FLUTTER_VERSION:-see setup step}"
+            printf '**Hosted packages to promote:** %s\n\n' "$PACKAGE_COUNT"
+            printf '**From:** `%s/repository/%s`\n\n' "${BASE_URL%/}" "$INGESTION_REPO"
+            printf '**To:** `%s/repository/%s`\n\n' "${BASE_URL%/}" "$PRODUCTION_REPO"
+            echo "## Resolved hosted packages"
+            echo
+            echo '```text'
+            cat packages.tsv
+            echo '```'
+            echo
+            echo "Approve the \`cloudsmith-production\` environment to promote this exact graph."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload approval evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-approval-evidence
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/package-probe/pubspec.yaml
+            ${{ runner.temp }}/package-probe/pubspec.lock
+            ${{ runner.temp }}/package-probe/deps.json
+            ${{ runner.temp }}/package-probe/packages.tsv
+
+  promote-and-verify:
+    name: Promote and verify production
+    needs: ingest
+    environment: cloudsmith-production
+    runs-on: ubuntu-latest
+
+    env:
+      # Environment secret: only injected because this job declares the
+      # environment, and the environment requires a reviewer.
+      NEXUS_TOKEN: ${{ secrets.NEXUS_PROMOTION_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download approved evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: package-approval-evidence
+          path: ${{ runner.temp }}/package-probe
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ vars.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Assert promotion credential is available
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${NEXUS_TOKEN:-}" ]]; then
+            echo "NEXUS_PROMOTION_TOKEN is not set on the cloudsmith-production Environment." >&2
+            exit 1
+          fi
+
+          echo "Promotion token is present in the job environment."
+
+      - name: Promote packages
+        shell: bash
+        env:
+          NEXUS_BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          bash scripts/nexus-promote-packages.sh \
+            "$RUNNER_TEMP/package-probe/packages.tsv" \
+            "approved graph"
+
+      - name: Point lockfile to production
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          LOCKFILE="$RUNNER_TEMP/package-probe/pubspec.lock"
+
+          # Deliberately written without a trailing slash so the substitution
+          # matches the normalised URL that pub records.
+          INGESTION_URL="${BASE_URL%/}/repository/${INGESTION_REPO}"
+          PRODUCTION_URL="${BASE_URL%/}/repository/${PRODUCTION_REPO}"
+
+          sed -i "s#${INGESTION_URL}#${PRODUCTION_URL}#g" "$LOCKFILE"
+
+          # Only the repository URL may change. Names, versions and content
+          # hashes must stay exactly as approved.
+          if grep -q "$INGESTION_URL" "$LOCKFILE"; then
+            echo "Lockfile still references the ingestion repository." >&2
+            exit 1
+          fi
+
+          if ! grep -q "$PRODUCTION_URL" "$LOCKFILE"; then
+            echo "Lockfile does not reference the production repository." >&2
+            exit 1
+          fi
+
+          echo "Lockfile now resolves against ${PRODUCTION_URL}."
+
+      - name: Configure production registry
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          PRODUCTION_URL="${BASE_URL%/}/repository/${PRODUCTION_REPO}/"
+
+          dart pub token add "$PRODUCTION_URL" --env-var NEXUS_TOKEN
+
+          echo "PRODUCTION_URL=$PRODUCTION_URL" >> "$GITHUB_ENV"
+
+      - name: Verify production
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # An empty PUB_CACHE, so every package in the approved graph has to be
+          # served by production. Nothing can be masked by a warm cache.
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-production"
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+
+          echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+          echo "PUB_CACHE=$PUB_CACHE (empty)"
+
+          # `dart pub get`, not `flutter pub get`.
+          #
+          # The flutter wrapper re-resolves flutter_tools' own pubspec whenever
+          # PUB_HOSTED_URL changes, because flutter_tools' lockfile records the
+          # URLs its dependencies came from. That pulls the SDK toolchain
+          # (analyzer, dwds, dds, test, ...) into the resolution, and those
+          # packages are deliberately never promoted, so it fails regardless of
+          # the state of PUB_CACHE.
+          #
+          # dart pub resolves only this project. SDK dependencies still come
+          # from FLUTTER_ROOT, so the Flutter-specific graph is preserved, and
+          # every hosted package must come from production.
+          #
+          # --enforce-lockfile fails if the lockfile is not a valid resolution
+          # of pubspec.yaml, if a required version is unavailable, or if any
+          # hosted package content does not match the approved content hash.
+          dart pub get --enforce-lockfile
+
+          # An empty cache means a successful resolution had to download
+          # everything. Assert that each approved package really came from
+          # production, so a silent no-op cannot pass as success.
+          MISSING=0
+
+          while IFS=$'\t' read -r NAME VERSION || [[ -n "${NAME:-}" ]]; do
+            [[ -n "${NAME:-}" ]] || continue
+            if ! compgen -G "$PUB_CACHE/hosted/*/${NAME}-${VERSION}" >/dev/null; then
+              echo "Not downloaded from production: ${NAME}-${VERSION}" >&2
+              MISSING=$((MISSING + 1))
+            fi
+          done < packages.tsv
+
+          EXPECTED="$(wc -l < packages.tsv | tr -d ' ')"
+
+          if [[ "$MISSING" -ne 0 ]]; then
+            echo "${MISSING} of ${EXPECTED} approved packages were not served by production." >&2
+            exit 1
+          fi
+
+          echo "All ${EXPECTED} approved packages were downloaded from production."
+
+          {
+            echo
+            echo '## Production verification'
+            echo
+            printf 'Resolved the approved lockfile against production only, with an empty PUB_CACHE. All %s packages were served by production.\n\n' "$EXPECTED"
+            echo '```text'
+            echo "dart pub get --enforce-lockfile  ->  OK"
+            echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the consumer path with flutter pub get
+        working-directory: ${{ runner.temp }}/package-probe
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # What a developer or a build actually runs. Unlike `dart pub get`,
+          # the flutter wrapper re-resolves flutter_tools' own dependencies
+          # whenever PUB_HOSTED_URL changes, so this only works when the SDK
+          # baseline has been promoted to production.
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-consumer"
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+
+          # Force the toolchain bootstrap so the check is not satisfied by a
+          # resolution left over from an earlier step.
+          rm -rf "$FLUTTER_ROOT/packages/flutter_tools/.dart_tool"
+          rm -f "$FLUTTER_ROOT/bin/cache/flutter_tools.stamp"
+
+          if flutter pub get --enforce-lockfile 2>&1 | tee /tmp/consumer.log; then
+            echo "flutter pub get --enforce-lockfile succeeded against production."
+          else
+            echo >&2
+            echo "flutter pub get failed against production." >&2
+
+            if grep -qE 'flutter_tools|could not find package (test|analyzer|dwds)' /tmp/consumer.log; then
+              echo >&2
+              echo "The failure is in the Flutter SDK toolchain, not in the approved graph." >&2
+              echo "Run the 'Promote Flutter SDK baseline (Nexus)' workflow for Flutter ${FLUTTER_VERSION_LABEL:-$(flutter --version | head -1)}." >&2
+            fi
+
+            exit 1
+          fi
+
+          {
+            echo
+            echo '## Consumer verification'
+            echo
+            echo 'The command a developer or build actually runs, against production'
+            echo 'only, with an empty PUB_CACHE and the toolchain bootstrap forced:'
+            echo
+            echo '```text'
+            echo "flutter pub get --enforce-lockfile  ->  OK"
+            echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

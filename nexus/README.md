@@ -31,8 +31,9 @@ Tailscale. Não é impedimento: o sidecar roda em container e a imagem usa
 **userspace networking** por default, sem `/dev/net/tun` e sem `NET_ADMIN`.
 
 ```bash
-TS_AUTHKEY=tskey-auth-... docker compose -f nexus/docker-compose.yml \
-  --profile tailnet up -d
+# TAILSCALE_AUTH_KEY vem do .env da raiz; compose procura .env ao lado do
+# arquivo, então o --env-file é necessário
+docker compose --env-file .env -f nexus/docker-compose.yml --profile tailnet up -d
 
 # archive_url e o host gravado no pubspec.lock passam a ser o nome da tailnet
 NEXUS_PUBLIC_URL=https://nexus-pub-poc.<tailnet>.ts.net \

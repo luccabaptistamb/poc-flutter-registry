@@ -122,8 +122,70 @@ de metadata e um download do arquivo.
 | Variable | `NEXUS_PRODUCTION_REPO` | `pub-production` |
 | Variable | `FLUTTER_VERSION` | `3.44.9` |
 | Variable | `TAILSCALE_CI_TAG` | `tag:ci` (default se ausente) |
-| **Repository** secret | `TS_OAUTH_CLIENT_ID` | OAuth client da tailnet |
-| **Repository** secret | `TS_OAUTH_SECRET` | secret do mesmo client |
+| Variable | `TS_CLIENT_ID` | client id da federated identity |
+| Variable | `TS_AUDIENCE` | `api.tailscale.com/<client id>` |
+
+`TS_CLIENT_ID` e `TS_AUDIENCE` são **variables, não secrets**: a própria doc da
+Tailscale diz que os dois são públicos e ficam visíveis no admin console. Guardar
+como secret só dificultaria debugar.
+
+### Federated identity da tailnet (OIDC do GitHub)
+
+Substitui o OAuth client estático: o runner troca o JWT do GitHub por um token
+de curta duração, então não existe secret de longa duração para o Tailscale.
+Configurar em **Trust credentials → Credential → OpenID Connect**:
+
+```text
+Issuer   https://token.actions.githubusercontent.com
+Subject  repo:luccabaptistamb/poc-flutter-registry:*
+
+Custom claims
+  repository        luccabaptistamb/poc-flutter-registry
+  job_workflow_ref  luccabaptistamb/poc-flutter-registry/.github/workflows/nexus-*@refs/heads/poc/nexus
+
+Tags     tag:ci
+Scopes   auth_keys
+```
+
+**O `*` no subject não é preguiça, é necessidade.** O `sub` do GitHub muda de
+formato conforme o job declare ou não um environment:
+
+```text
+ingest / resolve-baseline / verify   repo:<owner>/<repo>:ref:refs/heads/poc/nexus
+promote-and-verify / promote-baseline repo:<owner>/<repo>:environment:cloudsmith-production
+```
+
+Um `sub` exato cobriria um dos dois e quebraria o outro — o mesmo erro que a POC
+do Cloudsmith documentou ao declarar `environment` nos claims. Como os claims
+são exigidos em AND, o aperto vem das custom claims, que existem nos dois
+tokens. A alternativa seria criar duas credenciais, uma por formato de `sub`.
+
+O `job_workflow_ref` prende as três workflows *e* a branch numa única claim. Ao
+promover para `main`, trocar o sufixo `@refs/heads/poc/nexus`; se ele ficar
+desatualizado, o token é recusado e a mensagem de erro fica no admin console, não
+no log do runner.
+
+O `aud` não entra como custom claim: a Tailscale gera a audience
+(`api.tailscale.com/<client id>`), a action a envia pelo input `audience`, e a
+validação é feita pela própria Tailscale.
+
+### ACL da tailnet
+
+```json
+{
+  "tagOwners": {
+    "tag:ci":       ["autogroup:admin"],
+    "tag:ci-nexus": ["autogroup:admin"]
+  },
+  "grants": [
+    { "src": ["tag:ci"], "dst": ["tag:ci-nexus"], "ip": ["tcp:443"] }
+  ]
+}
+```
+
+`tag:ci-nexus` é o nó do sidecar (default de `TS_EXTRA_ARGS` no compose) e
+`tag:ci` é o runner. A 443 é o `tailscale serve`, não o 8081 do Nexus, que nunca
+é exposto na tailnet.
 | **Repository** secret | `NEXUS_INGEST_TOKEN` | `base64(ci-ingestion:senha)` |
 | **Repository** secret | `NEXUS_CONSUMER_TOKEN` | `base64(pub-consumer:senha)` |
 | **Environment** secret | `NEXUS_PROMOTION_TOKEN` | `base64(ci-promotion:senha)` |
@@ -331,8 +393,9 @@ exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
 - [x] `bootstrap.sh` configura a capability `baseurl` via `NEXUS_PUBLIC_URL`
 - [x] step de join na tailnet nas seis jobs das três workflows
 - [ ] tailnet com MagicDNS e HTTPS Certificates habilitados
-- [ ] auth key para o sidecar e OAuth client para o runner
-- [ ] ACL permitindo `tag:ci` alcançar o nó do Nexus na 443
+- [x] auth key do sidecar no `.env` como `TAILSCALE_AUTH_KEY`
+- [ ] federated identity criada (issuer, subject, custom claims, `auth_keys`)
+- [ ] ACL com `tagOwners` e grant de `tag:ci` para `tag:ci-nexus` na 443
 - [ ] sidecar sobe (confirma que a interceptação de TLS não quebra o tailscaled)
 - [ ] `archive_url` sai com o hostname da tailnet, confirmado por GET
 - [ ] download de arquivo funciona pela tailnet
@@ -340,11 +403,11 @@ exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
 
 ### Fase 1 — identidade
 
-- [ ] 5 repository variables criadas
+- [ ] 7 repository variables criadas
 - [ ] `NEXUS_INGEST_TOKEN` como repository secret
 - [ ] `NEXUS_CONSUMER_TOKEN` como repository secret
 - [ ] `NEXUS_PROMOTION_TOKEN` como **Environment** secret
-- [ ] `TS_OAUTH_CLIENT_ID` e `TS_OAUTH_SECRET` como repository secrets
+- [x] `permissions: id-token: write` de volta, agora para a Tailscale
 - [x] confirmado que o job de ingestão não lê o secret de promoção
       (asserção automática nos jobs sem `environment:`)
 - [ ] Environment com required reviewer mantido

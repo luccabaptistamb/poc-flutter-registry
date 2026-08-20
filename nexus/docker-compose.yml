@@ -77,9 +77,10 @@ services:
         condition: service_healthy
 
     environment:
-      # Auth key or OAuth client secret. With an OAuth secret, the tag must be
-      # passed explicitly via TS_EXTRA_ARGS.
-      TS_AUTHKEY: ${TS_AUTHKEY:?TS_AUTHKEY is required for the tailnet profile}
+      # Auth key for the sidecar node. Named after the key already kept in the
+      # repository .env; compose looks for .env next to the compose file, so
+      # pass --env-file explicitly when it lives at the repository root.
+      TS_AUTHKEY: ${TAILSCALE_AUTH_KEY:?TAILSCALE_AUTH_KEY is required for the tailnet profile}
       # The MagicDNS name becomes nexus-pub-poc.<tailnet>.ts.net, which is what
       # ends up recorded in every pubspec.lock entry.
       TS_HOSTNAME: ${TS_HOSTNAME:-nexus-pub-poc}

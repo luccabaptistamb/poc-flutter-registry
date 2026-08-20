@@ -34,6 +34,8 @@ on:
 
 permissions:
   contents: read
+  # Required so the Tailscale action can request an OIDC token from GitHub.
+  id-token: write
 
 jobs:
 
@@ -54,10 +56,12 @@ jobs:
       # Nexus lives on the tailnet. If this step fails, the tailnet ACL or the
       # OAuth client is the problem, not the Nexus setup.
       - name: Join the tailnet
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@v4
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          # Workload identity federation: no static OAuth secret. The client id
+          # and audience are not secrets, so they are variables.
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
           tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
 
       - name: Report required variables
@@ -237,10 +241,12 @@ jobs:
           cache: true
 
       - name: Join the tailnet
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@v4
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          # Workload identity federation: no static OAuth secret. The client id
+          # and audience are not secrets, so they are variables.
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
           tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
 
       - name: Check production has no upstream

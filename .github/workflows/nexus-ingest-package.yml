@@ -22,13 +22,17 @@ on:
         required: true
         type: string
 
-# No `id-token: write`: Nexus has no OIDC in any edition, so CI authenticates
-# with a static credential. What replaces the OIDC claim binding is where the
-# credential lives: the promotion token is an Environment secret, so it only
-# exists in a job that declared the environment, and that job only starts after
-# the approval.
+# Nexus itself has no OIDC in any edition, so the registry credential is static.
+# What replaces the OIDC claim binding Cloudsmith had is where the credential
+# lives: the promotion token is an Environment secret, so it only exists in a job
+# that declared the environment, and that job only starts after the approval.
+#
+# `id-token: write` is here for a different reason: it lets the Tailscale action
+# authenticate by workload identity federation instead of a static OAuth secret.
 permissions:
   contents: read
+  # Required so the Tailscale action can request an OIDC token from GitHub.
+  id-token: write
 
 jobs:
 
@@ -50,10 +54,12 @@ jobs:
       # to join it before it can reach the registry. An OAuth client registers an
       # ephemeral node, removed shortly after the job ends.
       - name: Join the tailnet
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@v4
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          # Workload identity federation: no static OAuth secret. The client id
+          # and audience are not secrets, so they are variables.
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
           tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
 
       - name: Assert credential isolation
@@ -327,10 +333,12 @@ jobs:
           cache: true
 
       - name: Join the tailnet
-        uses: tailscale/github-action@v3
+        uses: tailscale/github-action@v4
         with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          # Workload identity federation: no static OAuth secret. The client id
+          # and audience are not secrets, so they are variables.
+          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE }}
           tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
 
       - name: Assert promotion credential is available

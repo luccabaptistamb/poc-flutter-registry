@@ -78,13 +78,13 @@ jobs:
           fi
 
           # NEXUS_PROMOTION_TOKEN must be an Environment secret of
-          # cloudsmith-production, not a repository secret. This job declares no
+          # nexus-production, not a repository secret. This job declares no
           # environment, so it must resolve to nothing. If it has a value here,
           # the ingestion job can write to production without approval and the
           # gate is decorative.
           if [[ -n "${PROMOTION_TOKEN:-}" ]]; then
             echo "The promotion token is readable by the ingestion job." >&2
-            echo "Move NEXUS_PROMOTION_TOKEN to the cloudsmith-production Environment" >&2
+            echo "Move NEXUS_PROMOTION_TOKEN to the nexus-production Environment" >&2
             echo "and delete the repository secret with the same name." >&2
             exit 1
           fi
@@ -292,7 +292,7 @@ jobs:
             cat packages.tsv
             echo '```'
             echo
-            echo "Approve the \`cloudsmith-production\` environment to promote this exact graph."
+            echo "Approve the \`nexus-production\` environment to promote this exact graph."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload approval evidence
@@ -310,7 +310,7 @@ jobs:
   promote-and-verify:
     name: Promote and verify production
     needs: ingest
-    environment: cloudsmith-production
+    environment: nexus-production
     runs-on: ubuntu-latest
 
     env:
@@ -351,7 +351,7 @@ jobs:
           set -euo pipefail
 
           if [[ -z "${NEXUS_TOKEN:-}" ]]; then
-            echo "NEXUS_PROMOTION_TOKEN is not set on the cloudsmith-production Environment." >&2
+            echo "NEXUS_PROMOTION_TOKEN is not set on the nexus-production Environment." >&2
             exit 1
           fi
 

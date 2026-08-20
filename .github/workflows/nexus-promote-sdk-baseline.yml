@@ -282,7 +282,7 @@ jobs:
   promote-baseline:
     name: Promote baseline and verify flutter pub get
     needs: resolve-baseline
-    environment: cloudsmith-production
+    environment: nexus-production
     runs-on: ubuntu-latest
 
     env:
@@ -327,7 +327,7 @@ jobs:
           set -euo pipefail
 
           [[ -n "${NEXUS_TOKEN:-}" ]] || {
-            echo "NEXUS_PROMOTION_TOKEN is not set on the cloudsmith-production Environment." >&2
+            echo "NEXUS_PROMOTION_TOKEN is not set on the nexus-production Environment." >&2
             exit 1
           }
 

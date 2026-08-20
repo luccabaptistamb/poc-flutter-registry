@@ -342,10 +342,13 @@ Os mesmos testes da POC original, agora contra o Nexus:
 ## Riscos específicos desta troca
 
 **O runner passa a ser o caminho dos dados.** No Cloudsmith o `copy` era
-server-side; aqui cada package trafega download + upload pelo túnel. O baseline
-do SDK são ~109 packages, e `analyzer`/`dwds` são de MBs. Tráfego estimado na
-casa de centenas de MB e tempo maior que os ~35 min que o Cloudsmith levou para
-95 cópias. A idempotência dá resumabilidade se o túnel cair no meio.
+server-side; aqui cada package trafega download + upload pelo túnel.
+
+**Medido, e melhor que a estimativa:** 100 packages promovidos em **7m20s** pela
+tailnet (run 32398271437), contra os ~35 min que o `cloudsmith copy` levou para
+95 cópias server-side. A estimativa original de "tempo maior que o Cloudsmith"
+estava errada, porque o custo lá não era banda, era a espera de sincronização
+depois de cada cópia. A idempotência dá resumabilidade se o túnel cair no meio.
 
 **Decisão recomendada desde já:** no deploy definitivo, rodar o job de promoção
 em runner **co-localizado com o Nexus**, mantendo o caminho de dados local. Para
@@ -412,9 +415,12 @@ Fase 4 passar.
 
 Duas decisões tomadas na migração:
 
-- **o Environment continua sendo `cloudsmith-production`.** O nome ficou
-  impróprio, mas é o gate que já existe com reviewer configurado; renomear é
-  cosmético e invalidaria a configuração atual;
+- **o Environment passou a ser `nexus-production`.** Começou reaproveitando o
+  `cloudsmith-production` para não recriar o gate; depois do primeiro run verde
+  foi renomeado, com reviewer e o secret de promoção recriados por API. O
+  `cloudsmith-production` continua existindo porque as workflows do Cloudsmith
+  ainda o usam. Renomear é seguro para os claims: o `sub` dos jobs com gate muda
+  para `...:environment:nexus-production`, e o subject é wildcard;
 - **o isolamento da credencial é verificado, não presumido.** O job de ingestão
   referencia `secrets.NEXUS_PROMOTION_TOKEN` e **falha se ele tiver valor**. Como
   Environment secrets não são injetados em job sem `environment:`, isso
@@ -490,8 +496,11 @@ exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
 
 ### Fase 4 — validação
 
-- [ ] testes A a E
-- [ ] baseline do SDK promovido
-- [ ] `flutter pub get` contra production apenas
+- [x] Teste C: `promote-baseline` ficou em `Waiting` até a aprovação
+- [x] Teste D: package não promovido falha contra production
+- [x] Teste E: reexecução — 9 dos 109 vieram `skipped`
+- [x] baseline do SDK promovido (`promoted=100 skipped=9`, 7m20s)
+- [x] `flutter pub get` contra production apenas, mais `flutter analyze`
+- [ ] Teste A: happy path com transitivos (`dio`)
+- [ ] Teste B: package que usa Flutter SDK
 - [ ] `dart pub get --enforce-lockfile` contra production apenas
-- [ ] package não promovido falha

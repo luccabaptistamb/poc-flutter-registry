@@ -117,7 +117,7 @@ jobs:
           if [[ -n "${PROMOTION_TOKEN:-}" ]]; then
             echo "The promotion token is readable outside the gated environment." >&2
             echo "NEXUS_PROMOTION_TOKEN must be an Environment secret of" >&2
-            echo "cloudsmith-production, and must not exist as a repository secret." >&2
+            echo "nexus-production, and must not exist as a repository secret." >&2
             exit 1
           fi
 
@@ -379,7 +379,7 @@ jobs:
             printf '| ingestion proxies pub.dev | `%s` |\n' "$PROBE_PACKAGE"
             printf '| archive_url uses the external hostname | `%s` |\n' "${BASE_URL%/}"
             printf '| ingestion identity has no access to production | `%s` |\n' "$PRODUCTION_REPO"
-            printf '| promotion token not readable without approval | `%s` |\n' "cloudsmith-production"
+            printf '| promotion token not readable without approval | `%s` |\n' "nexus-production"
             printf '| production has no upstream | `%s` |\n' "$PROBE_PACKAGE"
             printf '| negative test (dart pub get) | `%s` |\n' "$PROBE_PACKAGE"
           } >> "$GITHUB_STEP_SUMMARY"

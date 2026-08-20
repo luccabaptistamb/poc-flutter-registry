@@ -321,6 +321,12 @@ Some o `oidc-audience`, somem os `verify-auth`/`export-auth-token`, e some
 
 Os mesmos testes da POC original, agora contra o Nexus:
 
+> Run 32398072600 (`nexus-verify-setup`, 2026-08-20): os dois jobs verdes. Prova
+> o join por federation, o isolamento da credencial de promoção, acesso anônimo
+> recusado, `archive_url` no hostname da tailnet, ingestão sem acesso a
+> production, production sem upstream, e o Teste D — que também é a primeira
+> confirmação de `dart pub token add` contra HTTPS real.
+
 | Teste | O que prova |
 |---|---|
 | A | happy path com transitivos |
@@ -448,9 +454,9 @@ exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
 - [x] Base URL fixada e **Nexus reiniciado** (sem o restart o pub ignora)
 - [x] `archive_url` sai com o hostname da tailnet, confirmado por GET
 - [x] download de arquivo pela tailnet, com sha256 conferido
-- [ ] federated identity com `tag:ci` e scope `auth_keys`
-- [ ] grant de `tag:ci` para `tag:ci-nexus` na 443
-- [ ] `dart pub token add` aceita a URL (só verificável no runner)
+- [x] federated identity com `tag:ci` e scope `auth_keys`
+- [x] grant de `tag:ci` para `tag:ci-nexus` na 443
+- [x] `dart pub token add` aceita a URL (exercitado pelo Teste D no runner)
 
 > Tentativa de 2026-08-20: o sidecar sobe, alcança o control plane e gera
 > nodekey, e então falha com `requested tags [tag:ci-nexus] are invalid or not
@@ -465,14 +471,14 @@ exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
 
 ### Fase 1 — identidade
 
-- [ ] 7 repository variables criadas
-- [ ] `NEXUS_INGEST_TOKEN` como repository secret
-- [ ] `NEXUS_CONSUMER_TOKEN` como repository secret
-- [ ] `NEXUS_PROMOTION_TOKEN` como **Environment** secret
+- [x] variables criadas (`gh variable set`)
+- [x] `NEXUS_INGEST_TOKEN` como repository secret
+- [x] `NEXUS_CONSUMER_TOKEN` como repository secret
+- [x] `NEXUS_PROMOTION_TOKEN` como **Environment** secret
 - [x] `permissions: id-token: write` de volta, agora para a Tailscale
 - [x] confirmado que o job de ingestão não lê o secret de promoção
       (asserção automática nos jobs sem `environment:`)
-- [ ] Environment com required reviewer mantido
+- [x] Environment com required reviewer mantido
 
 ### Fase 3 — workflows
 

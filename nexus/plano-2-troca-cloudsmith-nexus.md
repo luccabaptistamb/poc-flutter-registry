@@ -137,22 +137,58 @@ Configurar em **Trust credentials → Credential → OpenID Connect**:
 
 ```text
 Issuer   https://token.actions.githubusercontent.com
-Subject  repo:luccabaptistamb/poc-flutter-registry:*
+Subject  repo:luccabaptistamb@254526108/poc-flutter-registry@1331259250:*
 
 Custom claims
   repository        luccabaptistamb/poc-flutter-registry
   job_workflow_ref  luccabaptistamb/poc-flutter-registry/.github/workflows/nexus-*@refs/heads/poc/nexus
 
-Tags     tag:ci
+Tags     tag:ci          (apenas esta)
 Scopes   auth_keys
 ```
+
+**O `sub` deste repositório carrega os IDs numéricos.** Medido pela workflow de
+diagnóstico, o valor emitido é:
+
+```text
+sub               repo:luccabaptistamb@254526108/poc-flutter-registry@1331259250:ref:refs/heads/poc/nexus
+repository        luccabaptistamb/poc-flutter-registry
+job_workflow_ref  luccabaptistamb/poc-flutter-registry/.github/workflows/nexus-*@refs/heads/poc/nexus
+```
+
+Ou seja, `owner@ownerId/repo@repoId` no `sub`, e nome simples em `repository` e
+`job_workflow_ref`. Um subject escrito como `repo:<owner>/<repo>:*`, que é o
+formato de toda a documentação, **não casa** — o token exchange devolve 403 sem
+dizer por quê, e o motivo só aparece em Trust credentials no admin console.
+
+**A credencial deve ter exatamente uma tag.** Com `tag:ci` e `tag:ci-nexus`
+selecionadas, a criação da auth key falha:
+
+```text
+unexpected error while creating authkey: Status: 400,
+Message: "requested tags [tag:ci] are invalid or not permitted"
+```
+
+A doc de OAuth clients explica: para uma tag só, a credencial precisa ter aquela
+tag e o chamador precisa pedir aquela tag. Para **mais de uma**, é obrigatório o
+padrão de tag proprietária:
+
+```json
+"tagOwners": {
+  "tag:ci-owner": ["autogroup:admin"],
+  "tag:ci":       ["tag:ci-owner"],
+  "tag:ci-nexus": ["tag:ci-owner"]
+}
+```
+
+com a credencial tendo `tag:ci-owner`. Como o runner só precisa de `tag:ci` — o
+sidecar usa auth key própria com `tag:ci-nexus` —, o caminho mais simples e de
+menor privilégio é deixar **só `tag:ci`** na credencial.
 
 Dois pontos observados ao criar a credencial em 2026-08-20:
 
 - **o campo Tags só aparece quando a tag já existe em `tagOwners`** e o scope de
-  auth keys está selecionado. Sem tag na credencial, o `--advertise-tags=tag:ci`
-  do runner tende a falhar do mesmo jeito que o sidecar falhou. Criar a
-  `tag:ci` em Access controls e reeditar a credencial;
+  auth keys está selecionado. Criar as tags em Access controls antes;
 - **scope `all read and write` é largo demais.** A credencial só precisa emitir
   auth key para registrar nó (`auth_keys`). Com escrita total, um JWT do GitHub
   que satisfaça as claims pode alterar a ACL, remover devices e criar outras

@@ -405,7 +405,13 @@ if [[ -n "${NEXUS_PUBLIC_URL:-}" ]]; then
   fi
 
   case "$(http_code "$RESULT")" in
-    200|201|204) log "Base URL set to ${PUBLIC_URL}" ;;
+    200|201|204)
+      log "Base URL set to ${PUBLIC_URL}"
+      log "  Restart Nexus for this to reach the pub metadata. Until then the"
+      log "  generated archive_url keeps the old host, even for packages that"
+      log "  were never requested before:"
+      log "    docker compose -f nexus/docker-compose.yml restart nexus"
+      ;;
     *) fail "Failed to set the Base URL: $(http_code "$RESULT") $(http_body "$RESULT")" ;;
   esac
 else

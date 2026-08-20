@@ -65,7 +65,7 @@ O `sha256` preservado é o achado que dispensa o Pro: `cloudsmith copy` não tem
 equivalente em CE, mas baixar do proxy e subir no hosted mantém o artifact
 idêntico, que é tudo que o modelo de evidência exige.
 
-## Seis coisas que não estão na documentação e custaram tempo
+## Sete coisas que não estão na documentação e custaram tempo
 
 **1. A EULA bloqueia tudo.** Antes de aceitá-la, *toda* requisição a repositório
 retorna 403 com uma mensagem sobre o onboarding wizard — parece erro de
@@ -154,6 +154,26 @@ PUT com "id" no body                    -> 204
 A mensagem do 400 aponta para o campo certo pelo motivo errado, e o 500 parece
 bug do servidor quando é validação faltando. O `bootstrap.sh` faz create ou
 update conforme o caso, e é idempotente.
+
+**7. A Base URL só chega ao plugin pub depois de restart.** Com a capability
+`active` e o valor correto, o `archive_url` continuou saindo com o host antigo —
+inclusive para packages nunca pedidos antes, então não era cache de metadata. O
+que expõe a diferença é comparar com a REST API na mesma requisição:
+
+```text
+                                     REST /v1/repositories      pub archive_url
+via localhost                        localhost:8081             localhost:8081
+via tailnet, antes do restart        ts.net  (correto)          localhost:8081
+via tailnet, depois do restart       ts.net                     ts.net
+```
+
+Ou seja, a camada REST usa o escopo da requisição e o plugin pub não; ele lê a
+Base URL na inicialização. Sem o restart, um consumidor recebe metadata correta
+com URLs de arquivo inalcançáveis — o modo de falha mais confuso possível, porque
+`pub get` falha no download e não na resolução.
+
+Depois do restart, nem é preciso invalidar cache: a URL é gerada por resposta, e
+os packages já cacheados passaram a anunciar o host novo.
 
 ## Equivalência Cloudsmith → Nexus CE
 

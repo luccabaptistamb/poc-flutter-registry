@@ -90,6 +90,16 @@ services:
       TS_SERVE_CONFIG: /config/serve-config.json
       TS_AUTH_ONCE: "true"
       TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:---advertise-tags=tag:ci-nexus}
+      # Verification aid, not part of the design: userspace networking does not
+      # route the container's own traffic through the tailnet, so nothing on this
+      # machine can reach the ts.net hostname. This HTTP proxy gives a way to
+      # check archive_url and downloads from here, the way a runner would see
+      # them. Bound to loopback below so it is not a gateway into the tailnet for
+      # anything else on the network. Drop both lines to remove it.
+      TS_OUTBOUND_HTTP_PROXY_LISTEN: :1055
+
+    ports:
+      - "127.0.0.1:1055:1055"
 
     volumes:
       - tailscale-state:/var/lib/tailscale

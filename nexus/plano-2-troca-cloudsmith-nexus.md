@@ -117,7 +117,7 @@ de metadata e um download do arquivo.
 
 | Onde | Nome | Valor |
 |---|---|---|
-| Variable | `NEXUS_BASE_URL` | `https://nexus-pub-poc.<tailnet>.ts.net` |
+| Variable | `NEXUS_BASE_URL` | `https://nexus-pub-poc.kudu-nessie.ts.net` |
 | Variable | `NEXUS_INGESTION_REPO` | `pub-ingestion` |
 | Variable | `NEXUS_PRODUCTION_REPO` | `pub-production` |
 | Variable | `FLUTTER_VERSION` | `3.44.9` |
@@ -146,6 +146,18 @@ Custom claims
 Tags     tag:ci
 Scopes   auth_keys
 ```
+
+Dois pontos observados ao criar a credencial em 2026-08-20:
+
+- **o campo Tags só aparece quando a tag já existe em `tagOwners`** e o scope de
+  auth keys está selecionado. Sem tag na credencial, o `--advertise-tags=tag:ci`
+  do runner tende a falhar do mesmo jeito que o sidecar falhou. Criar a
+  `tag:ci` em Access controls e reeditar a credencial;
+- **scope `all read and write` é largo demais.** A credencial só precisa emitir
+  auth key para registrar nó (`auth_keys`). Com escrita total, um JWT do GitHub
+  que satisfaça as claims pode alterar a ACL, remover devices e criar outras
+  credenciais — ou seja, o gate de aprovação do Environment deixaria de ser o
+  ponto mais fraco.
 
 **O `*` no subject não é preguiça, é necessidade.** O `sub` do GitHub muda de
 formato conforme o job declare ou não um environment:
@@ -392,11 +404,17 @@ exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
 - [x] sidecar no compose atrás do profile `tailnet`, com `serve` para o 8081
 - [x] `bootstrap.sh` configura a capability `baseurl` via `NEXUS_PUBLIC_URL`
 - [x] step de join na tailnet nas seis jobs das três workflows
-- [ ] tailnet com MagicDNS e HTTPS Certificates habilitados
+- [x] tailnet com MagicDNS e HTTPS Certificates habilitados
 - [x] auth key do sidecar no `.env` como `TAILSCALE_AUTH_KEY`
-- [ ] federated identity criada (issuer, subject, custom claims, `auth_keys`)
-- [ ] ACL com `tagOwners` e grant de `tag:ci` para `tag:ci-nexus` na 443
-- [ ] auth key autorizada para `tag:ci-nexus`
+- [x] ACL com `tagOwners`, e auth key autorizada para `tag:ci-nexus`
+- [x] sidecar registrado como `nexus-pub-poc.kudu-nessie.ts.net`, cert ACME emitido
+- [x] `tailscale serve` publicando `https://.../` para `http://nexus:8081`
+- [x] Base URL fixada e **Nexus reiniciado** (sem o restart o pub ignora)
+- [x] `archive_url` sai com o hostname da tailnet, confirmado por GET
+- [x] download de arquivo pela tailnet, com sha256 conferido
+- [ ] federated identity com `tag:ci` e scope `auth_keys`
+- [ ] grant de `tag:ci` para `tag:ci-nexus` na 443
+- [ ] `dart pub token add` aceita a URL (só verificável no runner)
 
 > Tentativa de 2026-08-20: o sidecar sobe, alcança o control plane e gera
 > nodekey, e então falha com `requested tags [tag:ci-nexus] are invalid or not

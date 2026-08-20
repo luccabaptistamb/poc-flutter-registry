@@ -56,10 +56,12 @@ jobs:
       - name: Join the tailnet
         uses: tailscale/github-action@v4
         with:
-          # Workload identity federation: no static OAuth secret. The client id
-          # and audience are not secrets, so they are variables.
-          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
-          audience: ${{ vars.TS_AUDIENCE }}
+          # Workload identity federation: no static OAuth secret. Tailscale
+          # publishes both values in the admin console, so a variable is the
+          # honest place for them; read from a secret as a fallback so it works
+          # either way.
+          oauth-client-id: ${{ vars.TS_CLIENT_ID || secrets.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE || secrets.TS_AUDIENCE }}
           tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
 
       - name: Assert credential isolation
@@ -335,10 +337,12 @@ jobs:
       - name: Join the tailnet
         uses: tailscale/github-action@v4
         with:
-          # Workload identity federation: no static OAuth secret. The client id
-          # and audience are not secrets, so they are variables.
-          oauth-client-id: ${{ vars.TS_CLIENT_ID }}
-          audience: ${{ vars.TS_AUDIENCE }}
+          # Workload identity federation: no static OAuth secret. Tailscale
+          # publishes both values in the admin console, so a variable is the
+          # honest place for them; read from a secret as a fallback so it works
+          # either way.
+          oauth-client-id: ${{ vars.TS_CLIENT_ID || secrets.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE || secrets.TS_AUDIENCE }}
           tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
 
       - name: Assert promotion credential is available

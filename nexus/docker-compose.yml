@@ -48,6 +48,55 @@ services:
     networks:
       - nexus
 
+  # Exposes Nexus on the tailnet as https://<TS_HOSTNAME>.<tailnet>.ts.net.
+  #
+  # Behind a `tailnet` profile, so the default `docker compose up -d` keeps
+  # behaving exactly as before:
+  #
+  #   TS_AUTHKEY=tskey-auth-... docker compose -f nexus/docker-compose.yml \
+  #     --profile tailnet up -d
+  #
+  # Userspace networking (the image default) is what makes this viable on a
+  # locked-down Windows host: nothing is installed on the host, and no
+  # /dev/net/tun or NET_ADMIN is required. The cost is throughput, which for a
+  # promotion path of tarballs is acceptable.
+  #
+  # Requirements on the tailnet side:
+  #   - MagicDNS and HTTPS Certificates enabled, otherwise Serve cannot get a
+  #     certificate and `dart pub token add` has no HTTPS URL to authenticate;
+  #   - an ACL that lets the CI tag reach this node on 443.
+  tailscale:
+    image: tailscale/tailscale:v1.90.10
+    container_name: nexus-tailscale
+    restart: unless-stopped
+    profiles:
+      - tailnet
+
+    depends_on:
+      nexus:
+        condition: service_healthy
+
+    environment:
+      # Auth key or OAuth client secret. With an OAuth secret, the tag must be
+      # passed explicitly via TS_EXTRA_ARGS.
+      TS_AUTHKEY: ${TS_AUTHKEY:?TS_AUTHKEY is required for the tailnet profile}
+      # The MagicDNS name becomes nexus-pub-poc.<tailnet>.ts.net, which is what
+      # ends up recorded in every pubspec.lock entry.
+      TS_HOSTNAME: ${TS_HOSTNAME:-nexus-pub-poc}
+      TS_STATE_DIR: /var/lib/tailscale
+      # Mounted as a directory, not a file: the image only detects updates that
+      # way.
+      TS_SERVE_CONFIG: /config/serve-config.json
+      TS_AUTH_ONCE: "true"
+      TS_EXTRA_ARGS: ${TS_EXTRA_ARGS:---advertise-tags=tag:ci-nexus}
+
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./tailscale:/config:ro
+
+    networks:
+      - nexus
+
 networks:
   # Named so that throwaway dart containers can resolve the instance as
   # http://nexus:8081 without depending on the host network.
@@ -57,3 +106,8 @@ networks:
 volumes:
   nexus-data:
     name: nexus-pub-poc-data
+
+  # Without persistent state the sidecar registers a new node on every restart,
+  # which changes the MagicDNS name and invalidates every approved lockfile.
+  tailscale-state:
+    name: nexus-pub-poc-tailscale

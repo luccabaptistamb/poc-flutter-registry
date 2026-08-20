@@ -367,7 +367,55 @@ create_user "ci-promotion" "ci-promotion"
 create_user "pub-consumer" "pub-consumer"
 
 # ---------------------------------------------------------------------------
-# 8. Summary
+# 8. Base URL
+# ---------------------------------------------------------------------------
+# Nexus derives archive_url from the incoming request, so behind a proxy it can
+# advertise an address the client cannot reach. The pub client then gets correct
+# metadata pointing at unreachable files.
+#
+# Worse, the host ends up recorded in every pubspec.lock entry, so it is part of
+# the approved evidence: changing it later invalidates every approved lockfile.
+#
+# Only set when NEXUS_PUBLIC_URL is given, so the local-only setup keeps working
+# without it.
+
+if [[ -n "${NEXUS_PUBLIC_URL:-}" ]]; then
+  PUBLIC_URL="${NEXUS_PUBLIC_URL%/}"
+
+  RESULT="$(api GET /service/rest/v1/capabilities)"
+  [[ "$(http_code "$RESULT")" == "200" ]] \
+    || fail "Could not list capabilities: $(http_body "$RESULT")"
+
+  BASEURL_ID="$(http_body "$RESULT" | jq -r '.[] | select(.type == "baseurl") | .id' | head -1)"
+
+  # The field is `properties`, a plain string map, not `attributes`: with the
+  # wrong name the API answers 400 "url must not be blank".
+  BASEURL_BODY="$(jq -n --arg url "$PUBLIC_URL" \
+    '{ type: "baseurl", enabled: true,
+       notes: "Set by nexus/bootstrap.sh so archive_url uses the external hostname",
+       properties: { url: $url } }')"
+
+  if [[ -n "$BASEURL_ID" ]]; then
+    # The id must be repeated inside the body. Without it the API answers 500
+    # with a NullPointerException instead of a validation error.
+    RESULT="$(api PUT "/service/rest/v1/capabilities/${BASEURL_ID}" \
+      "$(jq --arg id "$BASEURL_ID" '. + { id: $id }' <<< "$BASEURL_BODY")")"
+  else
+    RESULT="$(api POST /service/rest/v1/capabilities "$BASEURL_BODY")"
+  fi
+
+  case "$(http_code "$RESULT")" in
+    200|201|204) log "Base URL set to ${PUBLIC_URL}" ;;
+    *) fail "Failed to set the Base URL: $(http_code "$RESULT") $(http_body "$RESULT")" ;;
+  esac
+else
+  log "NEXUS_PUBLIC_URL not set; leaving the Base URL derived from the request."
+  log "  Required once Nexus is served through a tunnel, otherwise archive_url"
+  log "  points at an address the runner cannot reach."
+fi
+
+# ---------------------------------------------------------------------------
+# 9. Summary
 # ---------------------------------------------------------------------------
 
 log ""

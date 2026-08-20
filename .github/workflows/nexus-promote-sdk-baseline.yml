@@ -55,6 +55,15 @@ jobs:
           # resolution is observable and every package passes through ingestion.
           cache: false
 
+      # Nexus lives on the tailnet, not on the public internet. Ephemeral node,
+      # registered by an OAuth client and removed after the job.
+      - name: Join the tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
+
       - name: Configure ingestion registry
         shell: bash
         env:
@@ -290,6 +299,13 @@ jobs:
         with:
           flutter-version: ${{ vars.FLUTTER_VERSION }}
           cache: true
+
+      - name: Join the tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
 
       - name: Promote the baseline
         shell: bash

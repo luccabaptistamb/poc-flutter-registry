@@ -51,6 +51,15 @@ jobs:
           flutter-version: ${{ vars.FLUTTER_VERSION }}
           cache: true
 
+      # Nexus lives on the tailnet. If this step fails, the tailnet ACL or the
+      # OAuth client is the problem, not the Nexus setup.
+      - name: Join the tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
+
       - name: Report required variables
         shell: bash
         env:
@@ -226,6 +235,13 @@ jobs:
         with:
           flutter-version: ${{ vars.FLUTTER_VERSION }}
           cache: true
+
+      - name: Join the tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
 
       - name: Check production has no upstream
         shell: bash

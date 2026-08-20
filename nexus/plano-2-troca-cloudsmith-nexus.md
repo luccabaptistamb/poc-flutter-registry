@@ -49,18 +49,42 @@ Requisitos:
 - controle de acesso no próprio túnel (service token). Um Nexus com credencial
   estática exposto na internet é superfície demais.
 
-**Decidido: Tailscale.** O hostname será o MagicDNS do nó que roda o Nexus, com
-HTTPS por certificado do Tailscale. Consequências aceitas:
+**Decidido: Tailscale, com o client em container.** O host é um Windows
+corporativo travado, onde não é possível instalar o client — o que não bloqueia
+nada, porque a imagem `tailscale/tailscale` usa **userspace networking** por
+default, sem `/dev/net/tun` e sem `NET_ADMIN`. O sidecar está no
+`nexus/docker-compose.yml` atrás do profile `tailnet`, com `tailscale serve`
+terminando TLS e proxyando para `http://nexus:8081`.
 
-- o acesso é controlado pela própria tailnet, o que resolve o requisito de
-  controle de acesso sem expor nada na internet pública;
-- **o runner precisa entrar na tailnet.** Runner hospedado do GitHub exige o
-  `tailscale/github-action` com um auth key ou OAuth client, e o nó do runner é
-  efêmero — usar tag ACL própria e chave efêmera;
+Cloudflare Tunnel foi descartado por dois motivos, não por dificuldade de
+montar a imagem — o sidecar `cloudflared` seria igualmente simples:
+
+- túnel nomeado exige domínio próprio na Cloudflare; sem domínio sobra o quick
+  tunnel com URL efêmera, que é exatamente o que esta fase rejeita;
+- **o controle de acesso do túnel não é usável pelo cliente pub.** A doc do Dart
+  é explícita: o `pub` anexa *um* secret token às requisições, e o spec v2 manda
+  como `Authorization: Bearer`. O Access para automação exige
+  `CF-Access-Client-Id` e `CF-Access-Client-Secret` em header. Ou se põe bypass
+  nos paths do pub, deixando um Nexus de credencial estática alcançável
+  publicamente, ou o `flutter pub get` toma 403.
+
+O Tailscale não tem esse problema porque autentica na camada de rede, antes do
+HTTP, então não depende do que o cliente pub sabe enviar.
+
+Consequências aceitas:
+
+- **o runner precisa entrar na tailnet.** As três workflows têm o step
+  `tailscale/github-action@v3` com OAuth client, que registra nó efêmero;
 - o hostname é o da tailnet, não o do deploy definitivo. Os lockfiles aprovados
   na POC valem só para a POC; a evidência será regerada quando o Nexus tiver o
   endereço final. Custo aceito porque a POC prova o desenho, não produz o
-  inventário aprovado de verdade.
+  inventário aprovado de verdade;
+- **risco medido e afastado:** a preocupação era a interceptação de TLS do egress
+  do container quebrar a validação de certificado do `tailscaled`. Medido em
+  2026-08-20 de dentro do container: `controlplane`, `login` e `derp1` vêm com
+  certificado Let's Encrypt real e `curl` valida os três com o truststore
+  default. A interceptação vista em 12/08 era intermitente. Continua valendo
+  reconferir se o sidecar não subir.
 
 ### Verificações da fase
 
@@ -75,6 +99,11 @@ Através do túnel precisa virar o hostname do túnel. Se o Nexus estiver com Ba
 URL fixa apontando para outro lugar, o pub recebe URLs de arquivo inalcançáveis e
 falha no download, mesmo com a metadata correta.
 
+O mecanismo é a capability `baseurl`, e o `bootstrap.sh` já a configura quando
+`NEXUS_PUBLIC_URL` é passada (create ou update, idempotente, validado contra
+`localhost:8081`). O `nexus-verify-setup.yml` falha se o `archive_url` não sair
+com esse hostname.
+
 **2. `dart pub token add` exige HTTPS.** Não é possível autenticar por token em
 `http://`, o que torna o TLS do túnel requisito funcional, não apenas de
 segurança.
@@ -88,10 +117,13 @@ de metadata e um download do arquivo.
 
 | Onde | Nome | Valor |
 |---|---|---|
-| Variable | `NEXUS_BASE_URL` | `https://<hostname-estável>` |
+| Variable | `NEXUS_BASE_URL` | `https://nexus-pub-poc.<tailnet>.ts.net` |
 | Variable | `NEXUS_INGESTION_REPO` | `pub-ingestion` |
 | Variable | `NEXUS_PRODUCTION_REPO` | `pub-production` |
 | Variable | `FLUTTER_VERSION` | `3.44.9` |
+| Variable | `TAILSCALE_CI_TAG` | `tag:ci` (default se ausente) |
+| **Repository** secret | `TS_OAUTH_CLIENT_ID` | OAuth client da tailnet |
+| **Repository** secret | `TS_OAUTH_SECRET` | secret do mesmo client |
 | **Repository** secret | `NEXUS_INGEST_TOKEN` | `base64(ci-ingestion:senha)` |
 | **Repository** secret | `NEXUS_CONSUMER_TOKEN` | `base64(pub-consumer:senha)` |
 | **Environment** secret | `NEXUS_PROMOTION_TOKEN` | `base64(ci-promotion:senha)` |
@@ -294,20 +326,25 @@ exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
 ### Fase 0 — exposição
 
 - [x] provedor escolhido: Tailscale com MagicDNS
-- [ ] Nexus alcançável pelo hostname MagicDNS com HTTPS
-- [ ] runner hospedado entra na tailnet (chave efêmera + tag ACL própria)
-- [ ] aceito o custo de regerar a evidência quando o hostname definitivo existir
-- [ ] Base URL do Nexus coerente com o hostname da tailnet
-- [ ] `archive_url` reescrito para esse hostname, confirmado por GET
-- [ ] download de arquivo funciona pelo túnel
+- [x] client em container (userspace), sem instalar nada no host Windows
+- [x] sidecar no compose atrás do profile `tailnet`, com `serve` para o 8081
+- [x] `bootstrap.sh` configura a capability `baseurl` via `NEXUS_PUBLIC_URL`
+- [x] step de join na tailnet nas seis jobs das três workflows
+- [ ] tailnet com MagicDNS e HTTPS Certificates habilitados
+- [ ] auth key para o sidecar e OAuth client para o runner
+- [ ] ACL permitindo `tag:ci` alcançar o nó do Nexus na 443
+- [ ] sidecar sobe (confirma que a interceptação de TLS não quebra o tailscaled)
+- [ ] `archive_url` sai com o hostname da tailnet, confirmado por GET
+- [ ] download de arquivo funciona pela tailnet
 - [ ] `dart pub token add` aceita a URL (HTTPS)
 
 ### Fase 1 — identidade
 
-- [ ] 4 repository variables criadas
+- [ ] 5 repository variables criadas
 - [ ] `NEXUS_INGEST_TOKEN` como repository secret
 - [ ] `NEXUS_CONSUMER_TOKEN` como repository secret
 - [ ] `NEXUS_PROMOTION_TOKEN` como **Environment** secret
+- [ ] `TS_OAUTH_CLIENT_ID` e `TS_OAUTH_SECRET` como repository secrets
 - [x] confirmado que o job de ingestão não lê o secret de promoção
       (asserção automática nos jobs sem `environment:`)
 - [ ] Environment com required reviewer mantido

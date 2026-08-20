@@ -24,6 +24,25 @@ nexus/verify-setup.sh
 Credenciais geradas ficam em `nexus/.credentials` (gitignored). Nada secreto é
 impresso pelos scripts.
 
+### Expor na tailnet
+
+O host aqui é um Windows corporativo travado, onde não se instala o client do
+Tailscale. Não é impedimento: o sidecar roda em container e a imagem usa
+**userspace networking** por default, sem `/dev/net/tun` e sem `NET_ADMIN`.
+
+```bash
+TS_AUTHKEY=tskey-auth-... docker compose -f nexus/docker-compose.yml \
+  --profile tailnet up -d
+
+# archive_url e o host gravado no pubspec.lock passam a ser o nome da tailnet
+NEXUS_PUBLIC_URL=https://nexus-pub-poc.<tailnet>.ts.net \
+  NEXUS_ACCEPT_EULA=yes nexus/bootstrap.sh
+```
+
+O profile `tailnet` mantém o `docker compose up -d` puro funcionando como antes.
+Do lado da tailnet é preciso MagicDNS e HTTPS Certificates habilitados — sem
+certificado não há URL HTTPS, e `dart pub token add` recusa `http://`.
+
 ## Conclusão da avaliação
 
 **CE é suficiente para a POC.** Os 15 checks do `verify-setup.sh` passam,
@@ -45,7 +64,7 @@ O `sha256` preservado é o achado que dispensa o Pro: `cloudsmith copy` não tem
 equivalente em CE, mas baixar do proxy e subir no hosted mantém o artifact
 idêntico, que é tudo que o modelo de evidência exige.
 
-## Cinco coisas que não estão na documentação e custaram tempo
+## Seis coisas que não estão na documentação e custaram tempo
 
 **1. A EULA bloqueia tudo.** Antes de aceitá-la, *toda* requisição a repositório
 retorna 403 com uma mensagem sobre o onboarding wizard — parece erro de
@@ -83,6 +102,22 @@ Isso faz o problema parecer ser do Nexus. O `trust-outbound-ca.sh` lê o
 certificado que o container realmente recebe, instala o CA emissor e habilita o
 `useTrustStore`.
 
+**Remedido em 2026-08-20: a interceptação não estava ativa.** Do mesmo container,
+naquele momento:
+
+```text
+pub.dev                      Google Trust Services (WR3)
+controlplane.tailscale.com   Let's Encrypt (YE2)
+login.tailscale.com          Let's Encrypt (YE1)
+derp1.tailscale.com          Let's Encrypt (YE1)
+```
+
+Ou seja, a interceptação é intermitente — depende da rede em que a máquina está,
+não do container. Duas consequências: o `useTrustStore` continua necessário porque
+a interceptação pode voltar, e o sidecar do Tailscale não é bloqueado por ela
+(nenhum endpoint do control plane apareceu interceptado, e `curl` valida os três
+com o truststore default).
+
 **4. Negative cache de 24h esconde a correção.** O default do Nexus faz uma
 falha transitória de saída continuar respondendo 404 por um dia, e um remote com
 erro deixa o repositório em `AUTO_BLOCKED_UNAVAILABLE`. Depois de corrigir
@@ -103,6 +138,21 @@ Como o "token" é literalmente `base64(user:senha)`, ou seja, exatamente o valor
 de um header Basic, **um único secret serve para os dois usos** — desde que
 enviado como `Basic`, não `Bearer`. O `nexus-promote-packages.sh` usa `Basic` em
 todas as chamadas por isso.
+
+**6. A API de capabilities tem duas armadilhas.** A Base URL é uma capability
+(`type: baseurl`), e é o que faz o Nexus anunciar o hostname externo em vez de
+derivar da requisição. Configurá-la por API custou dois erros enganosos:
+
+```text
+body com "attributes": { "url": ... }   -> 400 "url must not be blank"
+body com "properties": { "url": ... }   -> 201        ← o schema é properties
+PUT sem repetir "id" no body            -> 500 NullPointerException
+PUT com "id" no body                    -> 204
+```
+
+A mensagem do 400 aponta para o campo certo pelo motivo errado, e o 500 parece
+bug do servidor quando é validação faltando. O `bootstrap.sh` faz create ou
+update conforme o caso, e é idempotente.
 
 ## Equivalência Cloudsmith → Nexus CE
 

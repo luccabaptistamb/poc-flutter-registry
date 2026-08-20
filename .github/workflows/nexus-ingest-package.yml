@@ -46,6 +46,16 @@ jobs:
           flutter-version: ${{ vars.FLUTTER_VERSION }}
           cache: true
 
+      # Nexus lives on the tailnet, not on the public internet, so the runner has
+      # to join it before it can reach the registry. An OAuth client registers an
+      # ephemeral node, removed shortly after the job ends.
+      - name: Join the tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
+
       - name: Assert credential isolation
         shell: bash
         env:
@@ -315,6 +325,13 @@ jobs:
         with:
           flutter-version: ${{ vars.FLUTTER_VERSION }}
           cache: true
+
+      - name: Join the tailnet
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
 
       - name: Assert promotion credential is available
         shell: bash

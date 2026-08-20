@@ -108,6 +108,37 @@ services:
     networks:
       - nexus
 
+  # A developer machine that can only reach pub-production. Behind a `consumer`
+  # profile, run on demand:
+  #
+  #   docker compose --env-file .env -f nexus/docker-compose.yml \
+  #     --profile consumer run --rm consumer             # resolve
+  #   ...                          run --rm consumer negative  # boundary check
+  #
+  # It goes through the tailnet hostname rather than http://nexus:8081, even
+  # though that is reachable on this network, because `dart pub token add`
+  # refuses a non-HTTPS URL. That makes this the same path a developer takes.
+  # Not being a tailnet node itself, it reaches the tailnet through the sidecar's
+  # outbound HTTP proxy.
+  consumer:
+    build:
+      context: ../consumer
+    image: nexus-pub-poc-consumer:flutter-3.44.9
+    profiles:
+      - consumer
+
+    depends_on:
+      nexus:
+        condition: service_healthy
+
+    environment:
+      NEXUS_PRODUCTION_URL: ${NEXUS_PRODUCTION_URL:-https://nexus-pub-poc.kudu-nessie.ts.net/repository/pub-production/}
+      NEXUS_TOKEN: ${NEXUS_CONSUMER_TOKEN:?NEXUS_CONSUMER_TOKEN is required for the consumer profile}
+      https_proxy: http://nexus-tailscale:1055
+
+    networks:
+      - nexus
+
 networks:
   # Named so that throwaway dart containers can resolve the instance as
   # http://nexus:8081 without depending on the host network.

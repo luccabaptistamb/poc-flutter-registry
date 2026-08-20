@@ -1,0 +1,18 @@
+name: consumer_app
+description: Resolves against pub-production only, the way a developer would.
+publish_to: none
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Approved through ingest-package.yml. Change this to something that was never
+  # promoted to see the governance boundary fail closed.
+  dio: 5.9.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter

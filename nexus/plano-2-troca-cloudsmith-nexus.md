@@ -321,6 +321,10 @@ Some o `oidc-audience`, somem os `verify-auth`/`export-auth-token`, e some
 
 Os mesmos testes da POC original, agora contra o Nexus:
 
+> Run 32399777253 (`nexus-ingest-package`, `dio` 5.9.0): grafo de 16 packages,
+> `promoted=2 skipped=14` porque 14 já vinham do baseline, todos os 16 servidos por
+> production, e as duas verificações finais verdes.
+>
 > Run 32398072600 (`nexus-verify-setup`, 2026-08-20): os dois jobs verdes. Prova
 > o join por federation, o isolamento da credencial de promoção, acesso anônimo
 > recusado, `archive_url` no hostname da tailnet, ingestão sem acesso a
@@ -501,6 +505,7 @@ exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
 - [x] Teste E: reexecução — 9 dos 109 vieram `skipped`
 - [x] baseline do SDK promovido (`promoted=100 skipped=9`, 7m20s)
 - [x] `flutter pub get` contra production apenas, mais `flutter analyze`
-- [ ] Teste A: happy path com transitivos (`dio`)
+- [x] Teste A: `dio` 5.9.0, 16 packages, `promoted=2 skipped=14`
+- [x] `dart pub get --enforce-lockfile` e `flutter pub get --enforce-lockfile`
+- [x] consumidor local em container resolve contra production (`consumer/`)
 - [ ] Teste B: package que usa Flutter SDK
-- [ ] `dart pub get --enforce-lockfile` contra production apenas

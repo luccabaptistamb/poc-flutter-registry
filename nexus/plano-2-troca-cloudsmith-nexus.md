@@ -396,6 +396,14 @@ exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
 - [x] auth key do sidecar no `.env` como `TAILSCALE_AUTH_KEY`
 - [ ] federated identity criada (issuer, subject, custom claims, `auth_keys`)
 - [ ] ACL com `tagOwners` e grant de `tag:ci` para `tag:ci-nexus` na 443
+- [ ] auth key autorizada para `tag:ci-nexus`
+
+> Tentativa de 2026-08-20: o sidecar sobe, alcança o control plane e gera
+> nodekey, e então falha com `requested tags [tag:ci-nexus] are invalid or not
+> permitted`. A tag precisa existir em `tagOwners` **e** a auth key precisa poder
+> usá-la (uma key criada sem tag não consegue advertise). Alternativa para um
+> teste rápido: `TS_EXTRA_ARGS=` vazio registra o nó sem tag, mas aí nenhum grant
+> por tag se aplica e o nó passa a ser um device pessoal — não é o desenho.
 - [ ] sidecar sobe (confirma que a interceptação de TLS não quebra o tailscaled)
 - [ ] `archive_url` sai com o hostname da tailnet, confirmado por GET
 - [ ] download de arquivo funciona pela tailnet

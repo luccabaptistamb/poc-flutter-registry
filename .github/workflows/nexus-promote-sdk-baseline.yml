@@ -1,0 +1,411 @@
+name: Promote Flutter SDK baseline (Nexus)
+
+run-name: >-
+  Promote SDK baseline for Flutter ${{ vars.FLUTTER_VERSION }}
+  requested by ${{ github.actor }}
+
+# Makes pub-production usable as the ONLY pub host for app development.
+#
+# The Flutter SDK needs hosted packages that are not part of any application's
+# dependency graph:
+#
+#   - flutter_tools' own dependencies (analyzer, dwds, dds, test, ...). The
+#     flutter wrapper re-resolves them whenever PUB_HOSTED_URL changes, so
+#     `flutter pub get` fails against a repository that does not have them.
+#   - the hosted dependencies of the SDK-provided packages an app declares:
+#     flutter, flutter_test, flutter_localizations, flutter_web_plugins,
+#     integration_test.
+#
+# This baseline is tied to a Flutter version. Re-run it after every SDK upgrade.
+#
+# The set is derived, never hardcoded: it comes from resolutions performed
+# through ingestion with the SDK's own pinned versions.
+#
+# On Nexus the promotion is download + upload through the runner, so this
+# workflow moves the whole baseline (~100 packages, hundreds of MB) over the
+# network. It is idempotent, so a failed run can simply be re-run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: Reason (e.g. initial baseline, SDK upgrade to X)
+        required: true
+        default: Make production usable as the only pub host
+        type: string
+
+permissions:
+  contents: read
+  # Required so the Tailscale action can request an OIDC token from GitHub.
+  id-token: write
+
+jobs:
+
+  resolve-baseline:
+    name: Resolve SDK baseline
+    runs-on: ubuntu-latest
+
+    env:
+      NEXUS_TOKEN: ${{ secrets.NEXUS_INGEST_TOKEN }}
+
+    steps:
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ vars.FLUTTER_VERSION }}
+          # No cache: the toolchain bootstrap must actually run so that its
+          # resolution is observable and every package passes through ingestion.
+          cache: false
+
+      # Nexus lives on the tailnet, not on the public internet. Ephemeral node,
+      # registered by an OAuth client and removed after the job.
+      - name: Join the tailnet
+        uses: tailscale/github-action@v4
+        with:
+          # Workload identity federation: no static OAuth secret. Tailscale
+          # publishes both values in the admin console, so a variable is the
+          # honest place for them; read from a secret as a fallback so it works
+          # either way.
+          oauth-client-id: ${{ vars.TS_CLIENT_ID || secrets.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE || secrets.TS_AUDIENCE }}
+          tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
+
+      - name: Configure ingestion registry
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "${NEXUS_TOKEN:-}" ]] \
+            || { echo "NEXUS_INGEST_TOKEN is not set." >&2; exit 1; }
+
+          INGESTION_URL="${BASE_URL%/}/repository/${INGESTION_REPO}/"
+          dart pub token add "$INGESTION_URL" --env-var NEXUS_TOKEN
+          echo "INGESTION_URL=$INGESTION_URL" >> "$GITHUB_ENV"
+
+      - name: Resolve the flutter_tools graph through ingestion
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-baseline"
+          export PUB_HOSTED_URL="$INGESTION_URL"
+
+          mkdir -p "$RUNNER_TEMP/baseline"
+
+          # Force the bootstrap: with a fresh PUB_CACHE and no prior resolution,
+          # the wrapper resolves flutter_tools through ingestion using the
+          # versions pinned by this SDK release.
+          rm -rf "$FLUTTER_ROOT/packages/flutter_tools/.dart_tool"
+          rm -f "$FLUTTER_ROOT/bin/cache/flutter_tools.stamp"
+
+          echo "::group::flutter --version (triggers the toolchain bootstrap)"
+          flutter --version
+          echo "::endgroup::"
+
+          TOOLCFG="$FLUTTER_ROOT/packages/flutter_tools/.dart_tool/package_config.json"
+
+          if [[ ! -f "$TOOLCFG" ]]; then
+            echo "flutter_tools was not resolved; package_config.json is absent." >&2
+            exit 1
+          fi
+
+          # rootUri points at PUB_CACHE/hosted/<host>/<name>-<version> for hosted
+          # packages. SDK-local packages use relative paths and are skipped.
+          # Dart package names cannot contain a hyphen, so the first hyphen is
+          # always the name/version separator.
+          jq -r '
+            .packages[]
+            | select(.rootUri | test("/hosted/"))
+            | .rootUri
+            | sub("^.*/hosted/[^/]+/"; "")
+            | capture("^(?<name>[^-]+)-(?<version>.+)$")
+            | [.name, .version]
+            | @tsv
+          ' "$TOOLCFG" \
+            | sort -u \
+            > "$RUNNER_TEMP/baseline/toolchain.tsv"
+
+          echo "flutter_tools hosted packages: $(wc -l < "$RUNNER_TEMP/baseline/toolchain.tsv")"
+          head -5 "$RUNNER_TEMP/baseline/toolchain.tsv"
+
+      - name: Resolve the SDK-provided package graph through ingestion
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-baseline"
+          export PUB_HOSTED_URL="$INGESTION_URL"
+
+          mkdir -p "$RUNNER_TEMP/sdk-probe"
+
+          # Everything an application can pull from the SDK. Their hosted
+          # dependencies belong to the SDK baseline, not to any single app.
+          cat > "$RUNNER_TEMP/sdk-probe/pubspec.yaml" <<'EOF'
+          name: sdk_baseline_probe
+          publish_to: none
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            flutter_localizations:
+              sdk: flutter
+            flutter_web_plugins:
+              sdk: flutter
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            integration_test:
+              sdk: flutter
+          EOF
+
+          cd "$RUNNER_TEMP/sdk-probe"
+
+          echo "::group::dart pub get for the SDK probe"
+          dart pub get
+          echo "::endgroup::"
+
+          dart pub deps --json > deps.json
+
+          jq -r '
+            .packages[]
+            | select(.source == "hosted")
+            | [.name, .version]
+            | @tsv
+          ' deps.json \
+            | sort -u \
+            > "$RUNNER_TEMP/baseline/sdk-packages.tsv"
+
+          echo "SDK-provided hosted packages: $(wc -l < "$RUNNER_TEMP/baseline/sdk-packages.tsv")"
+
+      - name: Build the baseline list
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd "$RUNNER_TEMP/baseline"
+
+          sort -u toolchain.tsv sdk-packages.tsv > sdk-baseline.tsv
+
+          if [[ ! -s sdk-baseline.tsv ]]; then
+            echo "The derived baseline is empty." >&2
+            exit 1
+          fi
+
+          # The two resolutions are independent, so the same package can legitimately
+          # appear in more than one version: the toolchain and the application-facing
+          # SDK graph have different constraints. A flat registry holds both and pub
+          # picks per project, so both are promoted. Recorded because it is worth
+          # seeing during review.
+          : > multi-version.txt
+
+          for name in $(cut -f1 sdk-baseline.tsv | sort | uniq -d); do
+            grep -P "^${name}\t" sdk-baseline.tsv >> multi-version.txt
+          done
+
+          if [[ -s multi-version.txt ]]; then
+            echo "Packages present in more than one version:"
+            cat multi-version.txt
+          else
+            echo "Every package resolved to a single version."
+          fi
+
+          echo "baseline packages: $(wc -l < sdk-baseline.tsv)"
+          cat sdk-baseline.tsv
+
+      - name: Write approval summary
+        shell: bash
+        env:
+          REASON: ${{ inputs.reason }}
+          FLUTTER_VERSION_VAR: ${{ vars.FLUTTER_VERSION }}
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          cd "$RUNNER_TEMP/baseline"
+
+          {
+            echo "# Flutter SDK baseline promotion"
+            echo
+            printf '**Flutter version:** `%s`\n\n' "$FLUTTER_VERSION_VAR"
+            printf '**Requested by:** `%s`\n\n' "$GITHUB_ACTOR"
+            printf '**Reason:** %s\n\n' "$REASON"
+            printf '**Target:** `%s/repository/%s`\n\n' "${BASE_URL%/}" "$PRODUCTION_REPO"
+            printf '**flutter_tools graph:** %s packages\n\n' "$(wc -l < toolchain.tsv)"
+            printf '**SDK-provided graph:** %s packages\n\n' "$(wc -l < sdk-packages.tsv)"
+            printf '**Baseline total (union):** %s packages\n\n' "$(wc -l < sdk-baseline.tsv)"
+            if [[ -s multi-version.txt ]]; then
+              printf '**Packages in more than one version:** %s\n\n' "$(wc -l < multi-version.txt)"
+              echo '```text'
+              cat multi-version.txt
+              echo '```'
+              echo
+              echo "The toolchain and the application-facing SDK graph resolve"
+              echo "independently, so both versions are promoted and pub picks per"
+              echo "project."
+              echo
+            fi
+            echo "> Every package in production is implicitly approved for use."
+            echo "> This baseline exists so that \`flutter pub get\` works against"
+            echo "> production alone. Review it as a set, and re-run after an SDK"
+            echo "> upgrade."
+            echo
+            echo "## Baseline"
+            echo
+            echo '```text'
+            cat sdk-baseline.tsv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload baseline evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-baseline-evidence
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/baseline/toolchain.tsv
+            ${{ runner.temp }}/baseline/sdk-packages.tsv
+            ${{ runner.temp }}/baseline/sdk-baseline.tsv
+            ${{ runner.temp }}/baseline/multi-version.txt
+            ${{ runner.temp }}/sdk-probe/pubspec.yaml
+            ${{ runner.temp }}/sdk-probe/pubspec.lock
+            ${{ runner.temp }}/sdk-probe/deps.json
+
+  promote-baseline:
+    name: Promote baseline and verify flutter pub get
+    needs: resolve-baseline
+    environment: nexus-production
+    runs-on: ubuntu-latest
+
+    env:
+      NEXUS_TOKEN: ${{ secrets.NEXUS_PROMOTION_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download baseline evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-baseline-evidence
+          # The artifact spans two directories, so it keeps its structure:
+          # evidence/baseline/*.tsv and evidence/sdk-probe/*.
+          path: ${{ runner.temp }}/evidence
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ vars.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Join the tailnet
+        uses: tailscale/github-action@v4
+        with:
+          # Workload identity federation: no static OAuth secret. Tailscale
+          # publishes both values in the admin console, so a variable is the
+          # honest place for them; read from a secret as a fallback so it works
+          # either way.
+          oauth-client-id: ${{ vars.TS_CLIENT_ID || secrets.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE || secrets.TS_AUDIENCE }}
+          tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
+
+      - name: Promote the baseline
+        shell: bash
+        env:
+          NEXUS_BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "${NEXUS_TOKEN:-}" ]] || {
+            echo "NEXUS_PROMOTION_TOKEN is not set on the nexus-production Environment." >&2
+            exit 1
+          }
+
+          BASELINE="$RUNNER_TEMP/evidence/baseline/sdk-baseline.tsv"
+
+          [[ -s "$BASELINE" ]] || {
+            echo "Baseline list not found at $BASELINE" >&2
+            find "$RUNNER_TEMP/evidence" -type f >&2
+            exit 1
+          }
+
+          bash scripts/nexus-promote-packages.sh "$BASELINE" "SDK baseline"
+
+      - name: Configure production registry
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+        run: |
+          set -euo pipefail
+
+          PRODUCTION_URL="${BASE_URL%/}/repository/${PRODUCTION_REPO}/"
+          dart pub token add "$PRODUCTION_URL" --env-var NEXUS_TOKEN
+          echo "PRODUCTION_URL=$PRODUCTION_URL" >> "$GITHUB_ENV"
+
+      - name: Verify flutter pub get against production only
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-verify"
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+
+          # Force the toolchain bootstrap to happen against production. This is
+          # the exact operation that fails when the baseline is missing.
+          rm -rf "$FLUTTER_ROOT/packages/flutter_tools/.dart_tool"
+          rm -f "$FLUTTER_ROOT/bin/cache/flutter_tools.stamp"
+
+          mkdir -p "$RUNNER_TEMP/consumer-probe"
+
+          cat > "$RUNNER_TEMP/consumer-probe/pubspec.yaml" <<'EOF'
+          name: consumer_probe
+          publish_to: none
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+          EOF
+
+          cd "$RUNNER_TEMP/consumer-probe"
+
+          echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+          echo "PUB_CACHE=$PUB_CACHE (empty)"
+
+          echo "::group::flutter pub get"
+          flutter pub get
+          echo "::endgroup::"
+
+          echo "::group::flutter analyze (exercises the toolchain)"
+          flutter analyze --no-pub || true
+          echo "::endgroup::"
+
+          {
+            echo
+            echo '## Consumer verification'
+            echo
+            echo 'With production as the only pub host, an empty PUB_CACHE and the'
+            echo 'toolchain bootstrap forced to re-run:'
+            echo
+            echo '```text'
+            echo "flutter pub get  ->  OK"
+            echo "PUB_HOSTED_URL=$PUB_HOSTED_URL"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

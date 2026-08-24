@@ -508,4 +508,4 @@ exige HTTPS, então a resolução contra o Nexus só roda depois do túnel.
 - [x] Teste A: `dio` 5.9.0, 16 packages, `promoted=2 skipped=14`
 - [x] `dart pub get --enforce-lockfile` e `flutter pub get --enforce-lockfile`
 - [x] consumidor local em container resolve contra production (`consumer/`)
-- [ ] Teste B: package que usa Flutter SDK
+- [x] Teste B: `shared_preferences` 2.5.5, `promoted=12 skipped=10`, sources `sdk` fora

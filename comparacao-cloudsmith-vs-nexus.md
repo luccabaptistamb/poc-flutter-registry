@@ -262,7 +262,7 @@ workflows, está no `bootstrap.sh` (17 KB), na exposição de rede e nas descobe
 | Teste | Cloudsmith | Nexus |
 |---|---|---|
 | A — happy path com transitivos (`dio`) | ✅ | ✅ 16 packages, `promoted=2 skipped=14` |
-| B — package com Flutter SDK | **não executado** | ✅ resolução; promoção aguardando aprovação |
+| B — package com Flutter SDK | **não executado** | ✅ 22 hosted, `promoted=12 skipped=10`, 3 sources `sdk` excluídas |
 | C — gate de aprovação bloqueia | ✅ | ✅ |
 | D — package não aprovado falha | ✅ | ✅ |
 | E — reexecução é idempotente | ✅ | ✅ 9 de 109 vieram `skipped` |
@@ -274,11 +274,12 @@ workflows, está no `bootstrap.sh` (17 KB), na exposição de rede e nas descobe
 O consumidor em container existe só na frente Nexus, mas é portável: trocar
 `PUB_HOSTED_URL` e o token o aponta para o Cloudsmith.
 
-No Nexus o Teste B usou `shared_preferences` 2.5.5 (run 32741490883). A parte que
-o teste existe para provar já está na evidência: o grafo tem três sources `sdk`
-(`flutter`, `sky_engine`, `flutter_web_plugins`), nenhuma delas vazou para o
-`packages.tsv`, e sobraram 22 packages hosted — incluindo as seis implementações
-de plataforma do próprio package.
+No Nexus o Teste B usou `shared_preferences` 2.5.5 (run 32741490883) e passou
+inteiro. O que ele prova: o grafo tem três sources `sdk` (`flutter`, `sky_engine`,
+`flutter_web_plugins`), **nenhuma vazou** para o `packages.tsv`, e os 22 packages
+hosted restantes — incluindo as seis implementações de plataforma do próprio
+package — foram promovidos (`promoted=12 skipped=10`, os 10 já vindos do baseline
+e do Teste A) e servidos por produção com `--enforce-lockfile` nos dois modos.
 
 O Teste B nunca rodou no Cloudsmith: os cinco runs do `ingest-package.yml`
 naquela frente foram todos `dio@5.9.0`. Vale registrar como lacuna simétrica, não
@@ -346,6 +347,8 @@ self-hosting — Artifactory é o candidato óbvio, e não foi avaliado.
 | 32398072600 | Nexus | identidade, isolamento de credencial, teste negativo |
 | 32398271437 | Nexus | baseline `promoted=100 skipped=9` em 7m20s |
 | 32399777253 | Nexus | `dio` 5.9.0, `promoted=2 skipped=14`, verificações verdes |
+| 32740640281 | Nexus | falha do túnel da POC: serve config perdido em restart |
+| 32741490883 | Nexus | `shared_preferences` 2.5.5, sources `sdk` excluídas, `promoted=12` |
 
 Detalhamento: `README.md` (Cloudsmith), `nexus/README.md` (achados da instância),
 `nexus/plano-2-troca-cloudsmith-nexus.md` (migração) e `consumer/README.md`.

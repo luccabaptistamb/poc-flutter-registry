@@ -1,0 +1,385 @@
+name: Verify Nexus setup
+
+run-name: Verify Nexus setup (${{ vars.NEXUS_BASE_URL }})
+
+# Preflight checks for the POC. Validates the Nexus side of the design without
+# promoting anything:
+#
+#   1. the repository variables and CI credentials are configured
+#   2. the promotion credential is NOT readable outside the gated environment
+#   3. anonymous access is refused
+#   4. pub-ingestion proxies pub.dev and rewrites archive_url into Nexus
+#   5. the ingestion identity cannot read production (least privilege)
+#   6. pub-production has no upstream, and an unapproved package does not
+#      resolve against it (Test D)
+#
+# Test D runs with a read-only consumer credential rather than the promotion
+# one, because that is the identity a developer or an application build has, and
+# because the promotion credential only exists inside the gated environment. It
+# also keeps this workflow free of any approval.
+#
+# This workflow is POC support tooling and can be deleted once the flow is
+# validated.
+
+on:
+  workflow_dispatch:
+    inputs:
+      unapproved_package:
+        description: >-
+          A package that must NOT exist in pub-production, used for the negative
+          test.
+        required: true
+        default: equatable
+        type: string
+
+permissions:
+  contents: read
+  # Required so the Tailscale action can request an OIDC token from GitHub.
+  id-token: write
+
+jobs:
+
+  ingestion-identity:
+    name: Ingestion identity and repositories
+    runs-on: ubuntu-latest
+
+    env:
+      NEXUS_TOKEN: ${{ secrets.NEXUS_INGEST_TOKEN }}
+
+    steps:
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ vars.FLUTTER_VERSION }}
+          cache: true
+
+      # Nexus lives on the tailnet. If this step fails, the tailnet ACL or the
+      # OAuth client is the problem, not the Nexus setup.
+      - name: Join the tailnet
+        uses: tailscale/github-action@v4
+        with:
+          # Workload identity federation: no static OAuth secret. Tailscale
+          # publishes both values in the admin console, so a variable is the
+          # honest place for them; read from a secret as a fallback so it works
+          # either way.
+          oauth-client-id: ${{ vars.TS_CLIENT_ID || secrets.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE || secrets.TS_AUDIENCE }}
+          tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
+
+      - name: Report required variables
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+          FLUTTER_VERSION_VAR: ${{ vars.FLUTTER_VERSION }}
+        run: |
+          set -euo pipefail
+
+          MISSING=0
+          for name in BASE_URL INGESTION_REPO PRODUCTION_REPO FLUTTER_VERSION_VAR; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "Missing repository variable for: $name" >&2
+              MISSING=1
+            else
+              printf '%-22s = %s\n' "$name" "${!name}"
+            fi
+          done
+
+          [[ "$MISSING" -eq 0 ]] || exit 1
+
+          # `dart pub token add` refuses http://, so a non-HTTPS endpoint cannot
+          # authenticate at all.
+          if [[ "$BASE_URL" != https://* ]]; then
+            echo "NEXUS_BASE_URL must be https:// for dart pub token add to work." >&2
+            exit 1
+          fi
+
+          echo "flutter: $(flutter --version | head -1)"
+          echo "dart:    $(dart --version)"
+
+      - name: Assert credential isolation
+        shell: bash
+        env:
+          PROMOTION_TOKEN: ${{ secrets.NEXUS_PROMOTION_TOKEN }}
+          CONSUMER_TOKEN: ${{ secrets.NEXUS_CONSUMER_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "${NEXUS_TOKEN:-}" ]] \
+            || { echo "NEXUS_INGEST_TOKEN repository secret is not set." >&2; exit 1; }
+          [[ -n "${CONSUMER_TOKEN:-}" ]] \
+            || { echo "NEXUS_CONSUMER_TOKEN repository secret is not set." >&2; exit 1; }
+
+          # This job declares no environment, so an Environment secret must
+          # resolve to nothing here. If it has a value, promotion is possible
+          # without approval and the gate is decorative.
+          if [[ -n "${PROMOTION_TOKEN:-}" ]]; then
+            echo "The promotion token is readable outside the gated environment." >&2
+            echo "NEXUS_PROMOTION_TOKEN must be an Environment secret of" >&2
+            echo "nexus-production, and must not exist as a repository secret." >&2
+            exit 1
+          fi
+
+          echo "Ingestion and consumer tokens present; promotion token not readable here."
+
+      - name: Check anonymous access is refused
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+          PROBE_PACKAGE: ${{ inputs.unapproved_package }}
+        run: |
+          set -euo pipefail
+
+          URL="${BASE_URL%/}/repository/${INGESTION_REPO}/api/packages/${PROBE_PACKAGE}"
+
+          CODE="$(
+            curl -sS --retry 3 --retry-delay 2 --retry-connrefused \
+              -o /dev/null -w '%{http_code}' "$URL"
+          )"
+
+          echo "anonymous GET ingestion metadata -> HTTP ${CODE}"
+
+          if [[ "$CODE" == "200" ]]; then
+            echo "Anonymous access is enabled; the registry is not private." >&2
+            echo "Disable it: Security -> Anonymous Access (Nexus enables it by default)." >&2
+            exit 1
+          fi
+
+          echo "Anonymous access is refused."
+
+      - name: Check ingestion proxies pub.dev
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+          PROBE_PACKAGE: ${{ inputs.unapproved_package }}
+        run: |
+          set -euo pipefail
+
+          URL="${BASE_URL%/}/repository/${INGESTION_REPO}/api/packages/${PROBE_PACKAGE}"
+
+          # Basic, not Bearer: the token is base64(user:password), and Basic is
+          # accepted by both the repository endpoints and the REST API, while
+          # Bearer only works on the repository endpoints (PubToken realm).
+          CODE="$(
+            curl -sS --retry 3 --retry-delay 2 --retry-connrefused \
+              -o /tmp/ingestion.json -w '%{http_code}' \
+              -H "Authorization: Basic ${NEXUS_TOKEN}" \
+              "$URL"
+          )"
+
+          echo "GET ingestion/api/packages/${PROBE_PACKAGE} -> HTTP ${CODE}"
+
+          if [[ "$CODE" != "200" ]]; then
+            echo "Ingestion did not serve pub.dev metadata." >&2
+            echo "Check the proxy remote URL, and outbound TLS if the network" >&2
+            echo "intercepts it (httpClient.connection.useTrustStore)." >&2
+            head -c 400 /tmp/ingestion.json >&2 || true
+            exit 1
+          fi
+
+          jq -r '"versions available upstream: \(.versions | length), latest: \(.latest.version)"' \
+            /tmp/ingestion.json
+
+          ARCHIVE_URL="$(jq -r '.latest.archive_url' /tmp/ingestion.json)"
+          echo "archive_url: $ARCHIVE_URL"
+
+          # Through a tunnel, Nexus must advertise the external hostname. If it
+          # advertises localhost or the internal name, pub gets URLs it cannot
+          # reach even though the metadata is correct.
+          if [[ "$ARCHIVE_URL" != "${BASE_URL%/}/repository/${INGESTION_REPO}/"* ]]; then
+            echo "archive_url does not point at ${BASE_URL%/}." >&2
+            echo "Set the Nexus Base URL to the external hostname." >&2
+            exit 1
+          fi
+
+          echo "archive_url is rewritten to the external Nexus hostname."
+
+      - name: Check the ingestion identity cannot read production
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+          PROBE_PACKAGE: ${{ inputs.unapproved_package }}
+        run: |
+          set -euo pipefail
+
+          URL="${BASE_URL%/}/repository/${PRODUCTION_REPO}/api/packages/${PROBE_PACKAGE}"
+
+          CODE="$(
+            curl -sS --retry 3 --retry-delay 2 --retry-connrefused \
+              -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Basic ${NEXUS_TOKEN}" \
+              "$URL"
+          )"
+
+          echo "ingestion identity GET production -> HTTP ${CODE}"
+
+          case "$CODE" in
+            401|403) echo "Least privilege holds: the ingestion identity has no access to production." ;;
+            *)
+              echo "The ingestion identity reached production with HTTP ${CODE}." >&2
+              echo "Its role is too broad; it must have no privilege on production." >&2
+              exit 1
+              ;;
+          esac
+
+  consumer-negative-test:
+    name: Test D - unapproved package must not resolve
+    runs-on: ubuntu-latest
+
+    env:
+      # Read-only on production: the identity a developer or an application
+      # build actually has.
+      NEXUS_TOKEN: ${{ secrets.NEXUS_CONSUMER_TOKEN }}
+
+    steps:
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ vars.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Join the tailnet
+        uses: tailscale/github-action@v4
+        with:
+          # Workload identity federation: no static OAuth secret. Tailscale
+          # publishes both values in the admin console, so a variable is the
+          # honest place for them; read from a secret as a fallback so it works
+          # either way.
+          oauth-client-id: ${{ vars.TS_CLIENT_ID || secrets.TS_CLIENT_ID }}
+          audience: ${{ vars.TS_AUDIENCE || secrets.TS_AUDIENCE }}
+          tags: ${{ vars.TAILSCALE_CI_TAG || 'tag:ci' }}
+
+      - name: Check production has no upstream
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+          PROBE_PACKAGE: ${{ inputs.unapproved_package }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "${NEXUS_TOKEN:-}" ]] \
+            || { echo "NEXUS_CONSUMER_TOKEN repository secret is not set." >&2; exit 1; }
+
+          URL="${BASE_URL%/}/repository/${PRODUCTION_REPO}/api/packages/${PROBE_PACKAGE}"
+
+          CODE="$(
+            curl -sS --retry 3 --retry-delay 2 --retry-connrefused \
+              -o /tmp/production.json -w '%{http_code}' \
+              -H "Authorization: Basic ${NEXUS_TOKEN}" \
+              "$URL"
+          )"
+
+          echo "GET production/api/packages/${PROBE_PACKAGE} -> HTTP ${CODE}"
+
+          if [[ "$CODE" == "200" ]]; then
+            echo "Production served metadata for a package that was never promoted." >&2
+            echo "Either it has a proxy/group upstream, or the package was promoted;" >&2
+            echo "pick another package for the negative test." >&2
+            exit 1
+          fi
+
+          if [[ "$CODE" != "404" ]]; then
+            echo "Unexpected status from production: ${CODE}" >&2
+            echo "A 401/403 here means the consumer credential is wrong, which would" >&2
+            echo "make the negative test pass for the wrong reason." >&2
+            head -c 400 /tmp/production.json >&2 || true
+            exit 1
+          fi
+
+          echo "Production correctly has no metadata for an unapproved package."
+
+      - name: Negative test - unapproved package must not resolve
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+          PROBE_PACKAGE: ${{ inputs.unapproved_package }}
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$PROBE_PACKAGE" =~ ^[a-z][a-z0-9_]*$ ]]; then
+            echo "Invalid Dart package name: $PROBE_PACKAGE" >&2
+            exit 1
+          fi
+
+          PRODUCTION_URL="${BASE_URL%/}/repository/${PRODUCTION_REPO}/"
+
+          # Authenticate first, so a failure means "not found" and not "401".
+          dart pub token add "$PRODUCTION_URL" --env-var NEXUS_TOKEN
+
+          mkdir -p "$RUNNER_TEMP/negative-probe"
+
+          cat > "$RUNNER_TEMP/negative-probe/pubspec.yaml" <<EOF
+          name: unapproved_probe
+          publish_to: none
+
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+
+            ${PROBE_PACKAGE}: any
+          EOF
+
+          cd "$RUNNER_TEMP/negative-probe"
+
+          export PUB_CACHE="$RUNNER_TEMP/pub-cache-negative"
+          export PUB_HOSTED_URL="$PRODUCTION_URL"
+
+          echo "Resolving '${PROBE_PACKAGE}' against production only..."
+
+          # `dart pub get`, not `flutter pub get`: the flutter wrapper would
+          # re-resolve flutter_tools' own dependencies against production and
+          # fail on the SDK toolchain, making this test pass for the wrong
+          # reason. See the note in nexus-ingest-package.yml.
+          if dart pub get 2>&1 | tee /tmp/negative.log; then
+            echo >&2
+            echo "NEGATIVE TEST FAILED." >&2
+            echo "Production resolved '${PROBE_PACKAGE}', which was never promoted." >&2
+            exit 1
+          fi
+
+          if ! grep -q "$PROBE_PACKAGE" /tmp/negative.log; then
+            echo >&2
+            echo "Resolution failed, but not because of '${PROBE_PACKAGE}'." >&2
+            echo "The negative test is inconclusive; inspect the output above." >&2
+            exit 1
+          fi
+
+          echo
+          echo "NEGATIVE TEST PASSED: production refused to resolve '${PROBE_PACKAGE}'."
+
+      - name: Summary
+        if: always()
+        shell: bash
+        env:
+          BASE_URL: ${{ vars.NEXUS_BASE_URL }}
+          INGESTION_REPO: ${{ vars.NEXUS_INGESTION_REPO }}
+          PRODUCTION_REPO: ${{ vars.NEXUS_PRODUCTION_REPO }}
+          PROBE_PACKAGE: ${{ inputs.unapproved_package }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "# Nexus setup verification"
+            echo
+            printf '**Result of this job:** `%s`\n\n' "$OUTCOME"
+            printf '**Nexus:** `%s`\n\n' "${BASE_URL%/}"
+            echo '| check | target |'
+            echo '| --- | --- |'
+            printf '| anonymous access refused | `%s` |\n' "$INGESTION_REPO"
+            printf '| ingestion proxies pub.dev | `%s` |\n' "$PROBE_PACKAGE"
+            printf '| archive_url uses the external hostname | `%s` |\n' "${BASE_URL%/}"
+            printf '| ingestion identity has no access to production | `%s` |\n' "$PRODUCTION_REPO"
+            printf '| promotion token not readable without approval | `%s` |\n' "nexus-production"
+            printf '| production has no upstream | `%s` |\n' "$PROBE_PACKAGE"
+            printf '| negative test (dart pub get) | `%s` |\n' "$PROBE_PACKAGE"
+          } >> "$GITHUB_STEP_SUMMARY"

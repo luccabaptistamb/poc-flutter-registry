@@ -1,0 +1,82 @@
+name: Diagnose GitHub OIDC claims
+
+run-name: Diagnose OIDC claims for ${{ github.ref_name }}
+
+# Temporary. The Tailscale token exchange answers 403 without saying why, on
+# purpose, so the only way to compare configuration against reality is to look at
+# the claims GitHub actually issues. Delete this workflow once the federated
+# identity works.
+#
+# Prints claims, never the token. The signature is dropped.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+
+  claims:
+    name: Claims as issued
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Request an ID token and print its claims
+        shell: bash
+        env:
+          AUDIENCE: ${{ vars.TS_AUDIENCE || secrets.TS_AUDIENCE }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${AUDIENCE:-}" ]]; then
+            echo "Neither vars.TS_AUDIENCE nor secrets.TS_AUDIENCE is set." >&2
+            exit 1
+          fi
+
+          # GitHub masks secret values in logs. So if `aud` below prints as ***,
+          # the audience in the token matches the configured value exactly, and
+          # any visible value means they differ.
+          RESPONSE="$(
+            curl -sS \
+              -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}"
+          )"
+
+          JWT="$(jq -r '.value' <<< "$RESPONSE")"
+
+          if [[ -z "$JWT" || "$JWT" == "null" ]]; then
+            echo "No token issued. Is id-token: write set?" >&2
+            exit 1
+          fi
+
+          # Claims only: field 2 of the JWT, base64url-decoded. The signature is
+          # never printed.
+          PAYLOAD="$(cut -d. -f2 <<< "$JWT" | tr '_-' '/+')"
+          case $(( ${#PAYLOAD} % 4 )) in
+            2) PAYLOAD="${PAYLOAD}==" ;;
+            3) PAYLOAD="${PAYLOAD}=" ;;
+          esac
+
+          CLAIMS="$(base64 -d <<< "$PAYLOAD")"
+
+          echo "--- claims that matter for the federated identity ---"
+          jq -r '{
+            iss, aud, sub,
+            repository, repository_owner,
+            ref, ref_type, event_name,
+            environment,
+            workflow_ref, job_workflow_ref
+          }' <<< "$CLAIMS"
+
+          {
+            echo '## Claims as issued'
+            echo
+            echo 'Subject and custom claims must match these values. `aud` shown as'
+            echo '`***` means it equals the configured audience.'
+            echo
+            echo '```json'
+            jq -r '{iss, aud, sub, repository, ref, environment, job_workflow_ref}' <<< "$CLAIMS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

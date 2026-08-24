@@ -44,6 +44,34 @@ O profile `tailnet` mantém o `docker compose up -d` puro funcionando como antes
 Do lado da tailnet é preciso MagicDNS e HTTPS Certificates habilitados — sem
 certificado não há URL HTTPS, e `dart pub token add` recusa `http://`.
 
+### `restart` não basta para o sidecar
+
+Depois de um restart do Docker Desktop, `docker compose restart tailscale` sobe o
+container com o bind mount de `./tailscale:/config` **vazio**, mesmo com o arquivo
+presente no host e o mount apontando para o caminho certo. O `tailscale serve`
+então inicia sem configuração e o nó passa a aceitar conexões sem nada atrás:
+
+```text
+docker exec nexus-tailscale tailscale --socket=/tmp/tailscaled.sock serve status
+No serve config                      ← sintoma
+
+# no log do sidecar, para cada tentativa de acesso
+netstack: could not connect to local backend server at 127.0.0.1:443
+```
+
+Do lado do consumidor isso aparece como `Got socket error trying to find package`,
+que parece problema de rede ou do Nexus — o Nexus está sadio. Um container novo com
+o mesmo bind enxerga o arquivo, o antigo não, e é assim que se confirma o
+diagnóstico:
+
+```bash
+docker run --rm -v "$PWD/nexus/tailscale:/config:ro" alpine:3 ls -l /config
+docker compose --env-file .env -f nexus/docker-compose.yml \
+  --profile tailnet up -d --force-recreate tailscale
+```
+
+Sempre `up -d --force-recreate`, nunca `restart`.
+
 ## Conclusão da avaliação
 
 **CE é suficiente para a POC.** Os 15 checks do `verify-setup.sh` passam,

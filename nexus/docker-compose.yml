@@ -133,7 +133,10 @@ services:
 
     environment:
       NEXUS_PRODUCTION_URL: ${NEXUS_PRODUCTION_URL:-https://nexus-pub-poc.kudu-nessie.ts.net/repository/pub-production/}
-      NEXUS_TOKEN: ${NEXUS_CONSUMER_TOKEN:?NEXUS_CONSUMER_TOKEN is required for the consumer profile}
+      # Not marked required here on purpose: compose interpolates every service in
+      # the file regardless of the selected profile, so `:?` would break the
+      # tailnet profile too. consume.sh refuses to run without it.
+      NEXUS_TOKEN: ${NEXUS_CONSUMER_TOKEN:-}
       https_proxy: http://nexus-tailscale:1055
 
     networks:

@@ -19,7 +19,7 @@ opções:
 > aprovada para consumo.
 
 Também são idênticos: os dois repositórios físicos (ingestão com upstream do
-`pub.dev`, produção sem upstream), a promoção explícita por artifact, o gate de
+`pub.dev`, produção sem upstream), a promoção explícita por pacote, o gate de
 aprovação em GitHub Environment, o `pubspec.lock` como evidência e
 `--enforce-lockfile` como verificação final.
 
@@ -56,15 +56,17 @@ diz nada sobre a tecnologia).
 Por package na promoção do baseline: **~33s no Cloudsmith, ~4,4s no Nexus.**
 
 Esse resultado contraria a expectativa registrada no plano. A previsão era que o
-Nexus fosse mais lento, porque em CE não existe cópia server-side e cada artifact
+Nexus fosse mais lento, porque em CE não existe cópia server-side e cada pacote
 trafega download + upload pelo runner, enquanto `cloudsmith copy` é uma operação
 interna do serviço. O que dominou não foi banda: foi a **espera de sincronização**
 do Cloudsmith depois de cada cópia (`is_sync_completed`). O Nexus faz upload
 síncrono e não tem essa etapa.
 
 Onde o Nexus é mais lento é no caminho do consumidor — `flutter pub get` levou 47s
-contra 24s. Parte disso é o tráfego passando pela tailnet em userspace
-networking, que é característica da exposição escolhida na POC, não do Nexus.
+contra 24s. Isso **não** é uma medida do Nexus: o tráfego passa por um túnel
+Tailscale em userspace networking, escolhido por ser a coisa mais simples que
+funcionava na POC. Numa exposição de produção esse número muda, para melhor ou
+para pior, e precisa ser remedido.
 
 ---
 
@@ -80,7 +82,7 @@ vazar, rotacionar ou revogar.
 **Zero day-2.** Sem instância para operar, atualizar, backupear ou monitorar. Sem
 TLS para gerenciar, sem exposição de rede para resolver.
 
-**Promoção é uma chamada.** `cloudsmith copy` move o artifact server-side; o
+**Promoção é uma chamada.** `cloudsmith copy` move o pacote server-side; o
 script de promoção tem 178 linhas contra 251 do equivalente Nexus, que precisa
 baixar, conferir e subir.
 
@@ -92,12 +94,12 @@ fora da documentação.
 **Custo recorrente por consumo.** Storage, transferência e seats. Como o proxy do
 `pub.dev` acumula (só o toolchain do Flutter trouxe 109 packages), o custo cresce
 com o uso. Números atuais devem sair da página de preços do fornecedor, não deste
-documento.
+documento, mas hoje (agosto/2026) o plano inicial parte de **150 USD/mês**.
 
 **Dependência de terceiro no caminho crítico do build.** Indisponibilidade do
 serviço para a CI e as máquinas dos developers. Não há mirror interno.
 
-**Artifacts e metadados fora do perímetro.** Relevante se houver requisito de
+**Pacotes e metadados fora do perímetro.** Relevante se houver requisito de
 residência de dados ou de inventário sob controle interno.
 
 **Promoção lenta em lote.** 52m42s para o baseline, por causa da espera de sync.
@@ -121,7 +123,7 @@ service account com Write nos dois repositories
 **Sem custo de licença e sem custo por consumo.** CE é gratuito. O custo é
 infraestrutura e tempo do time.
 
-**Artifacts dentro do perímetro.** O mirror do `pub.dev` é interno; a produção
+**Pacotes dentro do perímetro.** O mirror do `pub.dev` é interno; a produção
 também. Atende requisito de residência e dá resiliência se o `pub.dev` ficar
 indisponível — o cache local continua servindo o que já foi promovido.
 
@@ -158,10 +160,36 @@ um proxy de `pub.dev` em uso real cresce, e o teto de requests é por dia — CI
 muitas equipes pode encostar nele. Estourar significa migrar para Pro (custo) ou
 segmentar instâncias (complexidade).
 
-**Exposição de rede é problema seu.** Runners hospedados não alcançam a
-instância. Na POC isso foi resolvido com sidecar Tailscale e federated identity;
-em produção é decisão de arquitetura de rede (VPN, self-hosted runners, ou
-exposição controlada). **Este é o item de maior esforço não estimado.**
+**Exposição de rede é problema seu, e a POC não resolveu.** Runners hospedados
+não alcançam a instância. O que existe hoje é um sidecar Tailscale em container,
+com federated identity, escolhido por um motivo específico e não por desenho: o
+host é um Windows corporativo travado onde não se instala o client do Tailscale, e
+o sidecar em userspace networking dispensa `/dev/net/tun` e `NET_ADMIN`. Foi o
+caminho mais curto para provar o resto da arquitetura.
+
+**Isso não é production ready, e não deve ser lido como proposta.** Os motivos:
+
+- um sidecar único, sem redundância, no caminho de todo build;
+- userspace networking tem custo de throughput, e aparece nos 47s da seção 2;
+- o estado do nó vive num volume Docker; perdê-lo registra um nó novo, muda o
+  MagicDNS e **invalida todo `pubspec.lock` já aprovado**;
+- as ACLs e o `tagOwners` da tailnet foram configurados à mão, sem
+  infraestrutura como código;
+- a auth key é de longa duração e mora num `.env` local;
+- não há observabilidade nem alarme sobre o túnel.
+
+**Observado, não hipotético:** em 24/08 a primeira tentativa do Teste B falhou com
+`Got socket error trying to find package analyzer`. O Docker Desktop havia perdido
+o bind mount do serve config ao *restartar* o sidecar em vez de recriá-lo, então
+`tailscale serve` subiu sem configuração: a tailnet aceitava a conexão do runner e
+não havia nada escutando atrás dela. O Nexus estava sadio o tempo todo. Nenhum
+alarme disparou; o sintoma foi um build quebrado, e o diagnóstico exigiu comparar
+um container novo com o antigo. `--force-recreate` resolveu.
+
+Em produção isso é substituído por uma decisão de arquitetura de rede — VPN
+corporativa, self-hosted runners dentro do perímetro, ou exposição controlada com
+WAF e certificado gerenciado. **É o item de maior esforço ainda não estimado, e a
+POC não produziu evidência sobre ele.**
 
 **Hostname entra na evidência.** Cada entrada do `pubspec.lock` grava a URL do
 host. Mudar o endereço invalida toda evidência aprovada. Exige que o endpoint seja
@@ -188,7 +216,7 @@ host para a instância (a POC usou container; produção precisa de dimensioname
 volume persistente com backup
 TLS válido — dart pub token add recusa http://
 DNS estável, porque o hostname entra no pubspec.lock
-conectividade runner → instância
+conectividade runner → instância (em aberto: a POC usou um túnel provisório)
 EULA aceita
 credencial estática de promoção como Environment secret
 acesso anônimo desabilitado (é opt-out no Nexus, ao contrário do Cloudsmith)
@@ -210,7 +238,7 @@ acesso anônimo desabilitado (é opt-out no Nexus, ao contrário do Cloudsmith)
 | Espera de sync | necessária (`is_sync_completed`) | não existe |
 | Imutabilidade | não configurada | `writePolicy: ALLOW_ONCE` |
 | Idempotência | `skipped` se já existe | idem, e obrigatória por causa do `ALLOW_ONCE` |
-| Rede | internet pública | tailnet/VPN, mais um join por job |
+| Rede | internet pública | rede privada, mais um join por job; na POC um túnel provisório |
 | Auth nas APIs internas | uma credencial, um esquema | `Basic` na REST API, `Bearer` no `/repository` |
 
 ---
@@ -234,7 +262,7 @@ workflows, está no `bootstrap.sh` (17 KB), na exposição de rede e nas descobe
 | Teste | Cloudsmith | Nexus |
 |---|---|---|
 | A — happy path com transitivos (`dio`) | ✅ | ✅ 16 packages, `promoted=2 skipped=14` |
-| B — package com Flutter SDK | ✅ | pendente |
+| B — package com Flutter SDK | **não executado** | ✅ resolução; promoção aguardando aprovação |
 | C — gate de aprovação bloqueia | ✅ | ✅ |
 | D — package não aprovado falha | ✅ | ✅ |
 | E — reexecução é idempotente | ✅ | ✅ 9 de 109 vieram `skipped` |
@@ -246,6 +274,19 @@ workflows, está no `bootstrap.sh` (17 KB), na exposição de rede e nas descobe
 O consumidor em container existe só na frente Nexus, mas é portável: trocar
 `PUB_HOSTED_URL` e o token o aponta para o Cloudsmith.
 
+No Nexus o Teste B usou `shared_preferences` 2.5.5 (run 32741490883). A parte que
+o teste existe para provar já está na evidência: o grafo tem três sources `sdk`
+(`flutter`, `sky_engine`, `flutter_web_plugins`), nenhuma delas vazou para o
+`packages.tsv`, e sobraram 22 packages hosted — incluindo as seis implementações
+de plataforma do próprio package.
+
+O Teste B nunca rodou no Cloudsmith: os cinco runs do `ingest-package.yml`
+naquela frente foram todos `dio@5.9.0`. Vale registrar como lacuna simétrica, não
+como vantagem de nenhum dos lados — o mecanismo em teste (sources `sdk` não são
+promovidas) é o mesmo código nas duas, e está exercitado indiretamente pelo
+baseline, que promove o grafo hosted de `flutter_test`, `flutter_localizations` e
+`integration_test`.
+
 ---
 
 ## 8. Riscos residuais, por frente
@@ -255,6 +296,7 @@ O consumidor em container existe só na frente Nexus, mas é portável: trocar
 | Vazamento de credencial | baixo (não há) | médio — mitigado pelo Environment secret |
 | Indisponibilidade externa | fornecedor | `pub.dev` só afeta ingestão nova |
 | Indisponibilidade interna | — | instância única para todos os builds |
+| Exposição de rede | n/a | **não endereçado** — o túnel da POC é descartável |
 | Custo crescente com uso | sim | só se estourar o teto do CE |
 | Promoção não atômica | sim | sim — igual nas duas, mitigar com `concurrency` |
 | Baseline por versão de SDK | sim | sim — igual nas duas |
@@ -267,7 +309,7 @@ discutidas, mas não diferenciam as opções.
 
 ## 9. As duas perguntas que decidem
 
-**1. Os artifacts podem viver fora do perímetro?** Se a resposta for não, o
+**1. Os pacotes podem viver fora do perímetro?** Se a resposta for não, o
 Cloudsmith está descartado e a discussão passa a ser sobre como operar o Nexus
 com responsabilidade — rede, backup, disponibilidade e o teto do CE.
 
@@ -284,6 +326,8 @@ self-hosting — Artifactory é o candidato óbvio, e não foi avaliado.
 
 ## 10. Pontos abertos que não são cobertos por nenhuma das POCs
 
+- **arquitetura de rede definitiva entre runners e instância**, no caso Nexus: o
+  túnel da POC serve para provar a governança e nada além disso;
 - promoção atômica (`concurrency` serializando promoções);
 - retenção e limpeza do repositório de ingestão, que cresce indefinidamente;
 - scanner de vulnerabilidade e licença, fora de escopo nas duas frentes;
